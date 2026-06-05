@@ -927,6 +927,14 @@ class NetflixBot(commands.Bot):
 
     async def setup_hook(self):
         await self.add_cog(GeneratorCog(self))
+        # ── Always wipe global commands first so ghost commands never linger ──
+        # Ghost commands appear when the bot previously synced globally and now
+        # syncs to a guild (or vice-versa). Clearing + syncing both scopes on
+        # every startup guarantees a clean slate regardless of prior state.
+        self.tree.clear_commands(guild=None)
+        await self.tree.sync()
+        print("[Bot] Global commands cleared.")
+
         guild_id = os.environ.get("DISCORD_GUILD_ID", "").strip()
         if guild_id:
             try:
@@ -938,7 +946,9 @@ class NetflixBot(commands.Bot):
                 print(f"[Bot] Commands synced to guild {guild_id}.")
             except Exception as e:
                 print(f"[Bot] Guild sync failed ({e}). Falling back to global.")
+                self.tree.clear_commands(guild=None)
                 await self.tree.sync()
+                print("[Bot] Commands synced globally (up to 1 hour to appear).")
         else:
             self.tree.clear_commands(guild=None)
             await self.tree.sync()
