@@ -927,30 +927,32 @@ class NetflixBot(commands.Bot):
 
     async def setup_hook(self):
         await self.add_cog(GeneratorCog(self))
-        # ── Always wipe global commands first so ghost commands never linger ──
-        # Ghost commands appear when the bot previously synced globally and now
-        # syncs to a guild (or vice-versa). Clearing + syncing both scopes on
-        # every startup guarantees a clean slate regardless of prior state.
-        self.tree.clear_commands(guild=None)
-        await self.tree.sync()
-        print("[Bot] Global commands cleared.")
+        # Commands are now in the in-memory global tree.
 
         guild_id = os.environ.get("DISCORD_GUILD_ID", "").strip()
         if guild_id:
             try:
                 g = discord.Object(id=int(guild_id))
+                # 1. Wipe old guild commands on Discord (push empty list)
                 self.tree.clear_commands(guild=g)
                 await self.tree.sync(guild=g)
+                # 2. Copy current in-memory commands → guild, then push
                 self.tree.copy_global_to(guild=g)
                 await self.tree.sync(guild=g)
                 print(f"[Bot] Commands synced to guild {guild_id}.")
+                # 3. NOW wipe global scope to kill any lingering global ghosts
+                #    (safe to do after guild sync — in-memory global list no
+                #     longer needed, commands are already live on the guild)
+                self.tree.clear_commands(guild=None)
+                await self.tree.sync()
+                print("[Bot] Global ghost commands cleared.")
             except Exception as e:
                 print(f"[Bot] Guild sync failed ({e}). Falling back to global.")
-                self.tree.clear_commands(guild=None)
                 await self.tree.sync()
                 print("[Bot] Commands synced globally (up to 1 hour to appear).")
         else:
-            self.tree.clear_commands(guild=None)
+            # Global mode: push current commands (no clear needed — sync
+            # replaces whatever Discord has with exactly what's in memory now)
             await self.tree.sync()
             print("[Bot] Commands synced globally (up to 1 hour to appear).")
 
