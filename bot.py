@@ -1,10 +1,12 @@
 import asyncio
 import html
+import http.server
 import io
 import json
 import os
 import re
 import sys
+import threading
 import unicodedata
 import zipfile
 from datetime import datetime, timezone
@@ -18,6 +20,38 @@ from urllib3.exceptions import InsecureRequestWarning
 
 load_dotenv()
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
+
+# ==========================================
+# FAKE PORT SERVER  (keeps Render alive)
+# ==========================================
+
+def _start_fake_server():
+    """
+    Spin up a minimal HTTP server so Render (and similar platforms) see a
+    live web-service port and never kill the process for 'no open port'.
+    Listens on $PORT (default 10000).  Runs in a daemon thread — invisible
+    to the Discord bot logic.
+    """
+    port = int(os.environ.get("PORT", "10000"))
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"OK"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass  # silence access-log noise
+
+    server = http.server.HTTPServer(("0.0.0.0", port), _Handler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    print(f"[KeepAlive] Fake HTTP server listening on port {port}")
+
+_start_fake_server()
 
 # ==========================================
 # CHANNEL IDs  (set in .env or Replit Secrets)
@@ -310,22 +344,40 @@ _EXTRA_MEMBER_PATTERNS = (
     r"ekstra\s+uye\s+bir\s+baskasinin\s+planinda",
 )
 
-# Strings present on Netflix's login page (dead / expired cookie)
+# Strings present on Netflix's login page (dead / expired cookie).
+# NOTE: '"login"' and '"authURL"' were intentionally removed — they appear
+# inside JavaScript bundles on valid /account pages and caused false positives
+# (live cookies being flagged as dead).  The four markers below are unique to
+# the rendered login form and do NOT appear on authenticated account pages.
 _LOGIN_PAGE_MARKERS = (
-    '"login"',
     "LoginForm",
     "login-form",
-    '"authURL"',
     "password-input",
     "sign-in-form",
 )
 
 
 def _is_login_page(url: str, text: str) -> bool:
-    """Return True if Netflix redirected us to the login / sign-in page."""
+    """Return True if Netflix redirected us to the login / sign-in page.
+
+    Changes vs original:
+    - URL check is now exact-segment only (/login, /login?, /loginhelp, /signup)
+      to avoid false matches on paths like /account/login-history.
+    - Text-marker threshold raised to 2 out of the 4 high-confidence markers
+      (the generic '"login"' and '"authURL"' markers were removed because they
+      appear on valid account pages inside embedded JS bundles).
+    - The entire check is skipped by check_nf_cookie() when membershipStatus
+      was already successfully extracted — guaranteeing no false positives for
+      live cookies whose pages happen to contain login-related JS fragments.
+    """
     url_lower = url.lower()
-    if any(x in url_lower for x in ("/login", "/loginhelp", "/signup")):
-        return True
+    # Only flag as login page for unambiguous login/signup URL segments
+    login_url_segments = ("/login", "/loginhelp", "/signup")
+    for seg in login_url_segments:
+        # Match /login at end-of-path or followed by ? or /
+        if re.search(re.escape(seg) + r"(?:[/?#]|$)", url_lower):
+            return True
+    # Require at least 2 of the high-confidence form markers
     return sum(1 for m in _LOGIN_PAGE_MARKERS if m in text) >= 2
 
 
@@ -376,10 +428,6 @@ def check_nf_cookie(cookie_text: str) -> dict:
 
     text = r.text
 
-    # ── Dead-cookie fast check: Netflix redirects expired sessions to login ──
-    if _is_login_page(r.url, text):
-        return {"ok": False, "reason": "Cookie expired (redirected to login)."}
-
     # ── Step 1: GraphQL fast path (works when page returns pure JSON) ────────
     info = _extract_graphql_info(text)
 
@@ -392,6 +440,13 @@ def check_nf_cookie(cookie_text: str) -> dict:
     # ── Step 3: Extra-member detection via page text ──────────────────────────
     if any(re.search(p, text, re.IGNORECASE) for p in _EXTRA_MEMBER_PATTERNS):
         info["isExtraMember"] = True
+
+    # ── Dead-cookie check — only run when we found NO account data ───────────
+    # If membershipStatus was extracted, the cookie is clearly alive; skipping
+    # the login-page check here prevents false positives from JS fragments.
+    if not info.get("membershipStatus") and not info.get("isExtraMember"):
+        if _is_login_page(r.url, text):
+            return {"ok": False, "reason": "Cookie expired (redirected to login)."}
 
     if _is_subscribed(info):
         return {
@@ -882,6 +937,7 @@ class NetflixBot(commands.Bot):
 
     async def on_ready(self):
         print(f"[Bot] ✅ Logged in as {self.user} (ID: {self.user.id})")
+        print("[Bot] 🟢 Your bot is Live")
         await self.change_presence(activity=discord.Game(name="Netflix 🎬"))
 
     async def _on_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
