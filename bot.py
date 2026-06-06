@@ -8,8 +8,13 @@ import re
 import sys
 import threading
 import unicodedata
+import warnings
 import zipfile
 from datetime import datetime, timezone
+
+# Suppress SyntaxWarnings from discord.py 2.x under Python 3.14+
+# (library uses 'return' inside 'finally' blocks — cosmetic, not a bug in our code)
+warnings.filterwarnings("ignore", category=SyntaxWarning, module=r"discord.*")
 
 import discord
 import requests
@@ -20,6 +25,14 @@ from urllib3.exceptions import InsecureRequestWarning
 
 load_dotenv()
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
+
+# Suppress the "Privileged message content intent is missing" warning —
+# this bot uses slash commands only and never reads message text.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*message content intent.*",
+    category=UserWarning,
+)
 
 # ==========================================
 # FAKE PORT SERVER  (keeps Render alive)
@@ -893,7 +906,7 @@ class GeneratorCog(commands.Cog):
         embed.add_field(name="📊 Total Scanned",   value=f"`{len(all_accounts)}`",       inline=True)
         if not ok:
             embed.add_field(name="⚠️ Warning", value="Supabase write may have failed.", inline=False)
-        await interaction.channel.send(embed=embed)
+        await interaction.followup.send(embed=embed)
 
     # ── admin: stock ───────────────────────────────────────────────────
 
