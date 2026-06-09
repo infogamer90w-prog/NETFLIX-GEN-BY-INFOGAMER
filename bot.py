@@ -56,6 +56,14 @@ def _start_fake_server():
             self.end_headers()
             self.wfile.write(body)
 
+        def do_HEAD(self):
+            # UptimeRobot Free Tier sends HEAD requests.
+            # We must send identical headers back, but WITHOUT the body text.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "2") # Length of b"OK" from GET
+            self.end_headers()
+
         def log_message(self, *args):
             pass  # silence access-log noise
 
@@ -65,6 +73,7 @@ def _start_fake_server():
     print(f"[KeepAlive] Fake HTTP server listening on port {port}")
 
 _start_fake_server()
+
 
 # ==========================================
 # CHANNEL IDs  (set in .env or Replit Secrets)
