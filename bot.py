@@ -587,27 +587,7 @@ def build_links_for_tier(token: str, tier: str) -> list[tuple[str, str]]:
     return links
 
 # ==========================================
-# 5. OWNER-BYPASS COOLDOWN
-# ==========================================
-
-from discord.app_commands import checks
-
-def owner_bypass_cooldown(rate: int, per: float, owner_id: int):
-    mapping = checks.CooldownMapping(checks.Cooldown(rate, per, checks.CooldownType.user))
-
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.user.id == owner_id:
-            return True
-        bucket = mapping.get_bucket(interaction)
-        retry_after = bucket.update_rate_limit()
-        if retry_after:
-            raise app_commands.CommandOnCooldown(bucket, retry_after)
-        return True
-
-    return app_commands.check(predicate)
-
-# ==========================================
-# 6. LOGIN BUTTON VIEW
+# 5. LOGIN BUTTON VIEW
 # ==========================================
 
 class LoginView(discord.ui.View):
@@ -617,7 +597,7 @@ class LoginView(discord.ui.View):
             self.add_item(discord.ui.Button(label=label, url=url, style=discord.ButtonStyle.link))
 
 # ==========================================
-# 7. CHANNEL GUARD
+# 6. CHANNEL GUARD
 # ==========================================
 
 def in_channel(channel_id: int):
@@ -630,7 +610,7 @@ def in_channel(channel_id: int):
     return app_commands.check(predicate)
 
 # ==========================================
-# 8. GENERATOR COG
+# 7. GENERATOR COG
 # ==========================================
 
 class GeneratorCog(commands.Cog):
@@ -655,7 +635,6 @@ class GeneratorCog(commands.Cog):
 
             check = await loop.run_in_executor(None, check_nf_cookie, cookie)
             if not check["ok"]:
-                # If NFToken failure, show generic error and stop
                 if "NFToken" in check.get("reason", ""):
                     await interaction.followup.send(
                         f"❌ Something went wrong while generating your account. "
@@ -663,19 +642,16 @@ class GeneratorCog(commands.Cog):
                         ephemeral=True,
                     )
                     return
-                # Otherwise (dead cookie etc.) just try next
                 print(f"[Gen] Dead {tier} cookie (attempt {attempt+1}): {check.get('reason')}")
                 continue
 
             nft = check.get("nft")
             if not nft:
-                # Should not happen if check is ok, but safety
                 continue
 
-            # Build appropriate links for the tier
             links = build_links_for_tier(nft["token"], tier)
 
-            # --- Ephemeral embed with buttons (visible only to user) ---
+            # Ephemeral embed with buttons (only visible to user)
             embed = discord.Embed(
                 title=f"{emoji} {label} Netflix — Generated!",
                 color=discord.Color.red(),
@@ -693,7 +669,7 @@ class GeneratorCog(commands.Cog):
 
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
-            # --- Public success embed (visible to everyone) ---
+            # Public success embed (visible to everyone)
             public_embed = discord.Embed(
                 title="🎉 Netflix Account Generated!",
                 description=(
@@ -714,21 +690,22 @@ class GeneratorCog(commands.Cog):
             ephemeral=True,
         )
 
+    # ── generation commands with owner bypass via dynamic key ──
     @app_commands.command(name="fgen", description="🆓 Generate a Free Netflix account")
     @in_channel(FGEN_CHANNEL_ID)
-    @owner_bypass_cooldown(1, 86400, OWNER_ID)
+    @app_commands.checks.cooldown(1, 86400, key=lambda i: i.user.id if i.user.id != OWNER_ID else object())
     async def fgen(self, interaction: discord.Interaction):
         await self._generate(interaction, "free", "Free", "🆓")
 
     @app_commands.command(name="bgen", description="🚀 Generate a Booster Netflix account")
     @in_channel(BGEN_CHANNEL_ID)
-    @owner_bypass_cooldown(1, 28800, OWNER_ID)
+    @app_commands.checks.cooldown(1, 28800, key=lambda i: i.user.id if i.user.id != OWNER_ID else object())
     async def bgen(self, interaction: discord.Interaction):
         await self._generate(interaction, "booster", "Booster", "🚀")
 
     @app_commands.command(name="pgen", description="💎 Generate a Premium Netflix account")
     @in_channel(PGEN_CHANNEL_ID)
-    @owner_bypass_cooldown(1, 21600, OWNER_ID)
+    @app_commands.checks.cooldown(1, 21600, key=lambda i: i.user.id if i.user.id != OWNER_ID else object())
     async def pgen(self, interaction: discord.Interaction):
         await self._generate(interaction, "premium", "Premium", "💎")
 
@@ -866,7 +843,7 @@ class GeneratorCog(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 # ==========================================
-# 9. BOT CLASS
+# 8. BOT CLASS
 # ==========================================
 
 class NetflixBot(commands.Bot):
@@ -950,7 +927,7 @@ class NetflixBot(commands.Bot):
             await reply_embed(emb)
 
 # ==========================================
-# 10. ENTRY POINT
+# 9. ENTRY POINT
 # ==========================================
 
 def main():
