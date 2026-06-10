@@ -430,14 +430,12 @@ def _normalize_boolean(val):
 def _format_date(value):
     if not value:
         return None
-    # try common patterns
     for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%B %d, %Y", "%B %Y"):
         try:
             dt = datetime.strptime(value, fmt)
             return dt.strftime("%B %d, %Y")
         except:
             pass
-    # try ISO
     try:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
         return dt.strftime("%B %d, %Y")
@@ -448,7 +446,6 @@ def _format_date(value):
 def _format_member_since(value):
     if not value:
         return None
-    # example: "2017-12-01" -> "December 2017"
     for fmt in ("%Y-%m-%d", "%Y-%m", "%B %Y"):
         try:
             dt = datetime.strptime(value, fmt)
@@ -465,7 +462,6 @@ def normalize_phone_number(digits, country_code=None):
         return None
     if str(digits).startswith("+"):
         return digits
-    # crude: if country is known, add prefix if starts with 0
     if country_code:
         country_code = country_code.strip().upper()
         if country_code == "IN" and digits.startswith("0"):
@@ -493,20 +489,16 @@ def _merge_info(graphql: dict, html: dict) -> dict:
         g = graphql.get(key)
         h = html.get(key)
         merged[key] = g if g not in (None, "", "null") else h
-    # Post-process
     if merged.get("maskedCard") and merged.get("paymentMethodType") is None:
         merged["paymentMethodType"] = "CC"
-    # normalize booleans
     for k in ("showExtraMemberSection", "holdStatus", "emailVerified"):
         val = merged.get(k)
         if val is not None:
             merged[k] = _normalize_boolean(val)
-    # format dates
     if merged.get("nextBillingDate"):
         merged["nextBillingDate"] = _format_date(merged["nextBillingDate"])
     if merged.get("memberSince"):
         merged["memberSince"] = _format_member_since(merged["memberSince"])
-    # country flag
     merged["countryDisplay"] = format_country(merged.get("countryOfSignup"))
     return merged
 
@@ -579,7 +571,7 @@ def check_nf_cookie(cookie_text: str) -> dict:
     graphql_info = _extract_graphql_info(text)
     html_info = _extract_html_info(text)
     info = _merge_info(graphql_info, html_info)
-    info["raw_text"] = text  # needed for extra member detection
+    info["raw_text"] = text
 
     if any(re.search(p, text, re.IGNORECASE) for p in _EXTRA_MEMBER_PATTERNS):
         info["showExtraMemberSection"] = "Yes"
@@ -604,7 +596,6 @@ def check_nf_cookie(cookie_text: str) -> dict:
             "full_info": info,
         }
 
-    # not subscribed but may still have some info
     return {"ok": False, "reason": f"No active subscription ({info.get('membershipStatus', 'unknown')})."}
 
 
@@ -830,10 +821,16 @@ class GeneratorCog(commands.Cog):
             if not nft:
                 continue
 
-            links = build_links_for_tier(nft["token"], tier)
             full_info = check.get("full_info", {})
 
-            # Build the detailed DM embed
+            # --- EXCLUDE ON-HOLD ACCOUNTS ---
+            if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
+                print(f"[Gen] Skipping on-hold {tier} cookie (attempt {attempt+1})")
+                continue  # treat as dead, do not give to user
+
+            links = build_links_for_tier(nft["token"], tier)
+
+            # Build the detailed DM embed – exactly matching the reference layout
             dm_embed = discord.Embed(
                 title=f"{emoji} {label} Netflix Account",
                 color=discord.Color.red(),
@@ -861,7 +858,7 @@ class GeneratorCog(commands.Cog):
                 dm_embed.add_field(name="📺 Streams", value=check["maxStreams"], inline=True)
             if full_info.get("planPrice"):
                 dm_embed.add_field(name="💰 Price", value=full_info["planPrice"], inline=True)
-            if full_info.get("holdStatus"):
+            if full_info.get("holdStatus") is not None:
                 dm_embed.add_field(name="⏸️ Hold Status", value=full_info["holdStatus"], inline=True)
             if full_info.get("showExtraMemberSection"):
                 dm_embed.add_field(name="👥 Extra Member", value=full_info["showExtraMemberSection"], inline=True)
@@ -884,7 +881,6 @@ class GeneratorCog(commands.Cog):
             except discord.Forbidden:
                 dm_success = False
 
-            # Ephemeral response (fallback if DM blocked)
             if not dm_success:
                 await interaction.followup.send(
                     "❌ I couldn't send you a DM. Please enable DMs and try again.",
@@ -892,10 +888,10 @@ class GeneratorCog(commands.Cog):
                 )
                 return
 
-            # Ephemeral success embed (short version)
+            # Ephemeral success embed
             ephemeral_embed = discord.Embed(
                 title=f"{emoji} {label} Netflix Generated!",
-                description=f"Account details have been sent to your DMs. Check your DM for login links.",
+                description="Account details have been sent to your DMs. Check your DM for login links.",
                 color=discord.Color.green(),
             )
             ephemeral_embed.set_footer(text=f"Expires: {nft.get('expires_at_utc', 'Unknown')} | One‑time use")
@@ -1027,8 +1023,15 @@ class GeneratorCog(commands.Cog):
 
         sorted_: dict[str, list[str]] = {"free": [], "booster": [], "premium": []}
         dead = 0
+        on_hold = 0   # <-- NEW counter for on‑hold accounts
+
         for cookie, res in zip(unique, results):
             if res["ok"]:
+                full_info = res.get("full_info", {})
+                # Skip on‑hold accounts – do not add to any tier
+                if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
+                    on_hold += 1
+                    continue
                 tier = classify_tier(res.get("plan", ""), res.get("quality", ""))
                 sorted_[tier].append(cookie)
             else:
@@ -1053,6 +1056,7 @@ class GeneratorCog(commands.Cog):
         embed.add_field(name="🆓 Free Added",      value=f"`{len(sorted_['free'])}`",    inline=True)
         embed.add_field(name="💀 Dead Filtered",   value=f"`{dead}`",                    inline=True)
         embed.add_field(name="♻️ Duplicates Skipped", value=f"`{dupes}`",               inline=True)
+        embed.add_field(name="⏸️ On Hold Skipped", value=f"`{on_hold}`",                 inline=True)
         embed.add_field(name="📊 Total Scanned",   value=f"`{len(all_accounts)}`",       inline=True)
         if not ok:
             embed.add_field(name="⚠️ Warning", value="Supabase write may have failed.", inline=False)
