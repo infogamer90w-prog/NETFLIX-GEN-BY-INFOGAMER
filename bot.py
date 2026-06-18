@@ -80,7 +80,7 @@ BGEN_CHANNEL_ID  = _int_env("BGEN_CHANNEL_ID")
 PGEN_CHANNEL_ID  = _int_env("PGEN_CHANNEL_ID")
 OWNER_ID         = int(os.environ.get("OWNER_ID", "1506365840273047714"))
 TICKET_CHANNEL_ID = 1506405663373525145
-VOUCH_CHANNEL_ID  = 1506405646906425384
+VOUCH_CHANNEL_ID  = 1516530704148598944   # Updated vouch channel ID
 
 # ==========================================
 # 1. SUPABASE CLOUD DATABASE
@@ -830,9 +830,15 @@ class GeneratorCog(commands.Cog):
 
             links = build_links_for_tier(nft["token"], tier)
 
-            # Build the detailed DM embed – exactly matching the reference layout
+            # ── DM Embed with full details & login instructions ──
             dm_embed = discord.Embed(
                 title=f"{emoji} {label} Netflix Account",
+                description=(
+                    "**📖 How to login:**\n"
+                    "Click the button below that matches your device. "
+                    "The link is **one‑time use** – open it immediately.\n"
+                    "If you need help, create a ticket in <#{TICKET_CHANNEL_ID}>."
+                ),
                 color=discord.Color.red(),
             )
             dm_embed.add_field(name="📌 Status",     value="Subscribed", inline=True)
@@ -888,7 +894,7 @@ class GeneratorCog(commands.Cog):
                 )
                 return
 
-            # Ephemeral success embed
+            # Ephemeral success embed (shown only to the command user)
             ephemeral_embed = discord.Embed(
                 title=f"{emoji} {label} Netflix Generated!",
                 description="Account details have been sent to your DMs. Check your DM for login links.",
@@ -897,17 +903,13 @@ class GeneratorCog(commands.Cog):
             ephemeral_embed.set_footer(text=f"Expires: {nft.get('expires_at_utc', 'Unknown')} | One‑time use")
             await interaction.followup.send(embed=ephemeral_embed, ephemeral=True)
 
-            # Public success embed
+            # ── Public success embed (refined, only shows who generated and a vouch reminder) ──
             public_embed = discord.Embed(
                 title="🎉 Netflix Account Generated!",
                 description=(
                     f"{interaction.user.mention} generated a **{label}** Netflix account.\n"
-                    f"Please check your DMs for login links.\n\n"
-                    f"**Login Guide:**\n"
-                    f"• Click the button matching your device.\n"
-                    f"• The link is one‑time use – open it immediately.\n"
-                    f"• If you encounter issues, create a ticket in <#{TICKET_CHANNEL_ID}>.\n\n"
-                    f"**Please vouch in <#{VOUCH_CHANNEL_ID}>** if you received a working account!"
+                    f"Check your DMs for login links.\n\n"
+                    f"Please vouch in <#{VOUCH_CHANNEL_ID}> if you received a working account!"
                 ),
                 color=discord.Color.green(),
             )
@@ -1013,7 +1015,8 @@ class GeneratorCog(commands.Cog):
                 if nid:
                     seen_ids.add(nid)
 
-        SEM = asyncio.Semaphore(10)
+        # Increase concurrency for faster restock processing
+        SEM = asyncio.Semaphore(20)
 
         async def _check(cookie: str) -> dict:
             async with SEM:
@@ -1023,7 +1026,7 @@ class GeneratorCog(commands.Cog):
 
         sorted_: dict[str, list[str]] = {"free": [], "booster": [], "premium": []}
         dead = 0
-        on_hold = 0   # <-- NEW counter for on‑hold accounts
+        on_hold = 0   # on‑hold counter (excluded from any tier)
 
         for cookie, res in zip(unique, results):
             if res["ok"]:
