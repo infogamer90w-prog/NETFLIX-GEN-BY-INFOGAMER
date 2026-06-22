@@ -79,7 +79,7 @@ FGEN_CHANNEL_ID  = _int_env("FGEN_CHANNEL_ID")
 BGEN_CHANNEL_ID  = _int_env("BGEN_CHANNEL_ID")
 PGEN_CHANNEL_ID  = _int_env("PGEN_CHANNEL_ID")
 OWNER_ID         = int(os.environ.get("OWNER_ID", "1506365840273047714"))
-TICKET_CHANNEL_ID = 1506405663373525145
+TICKET_CHANNEL_ID = 1516530741826289796
 VOUCH_CHANNEL_ID  = 1516530704148598944   # Updated vouch channel ID
 
 # ==========================================
@@ -785,6 +785,10 @@ def in_channel(channel_id: int):
 # 7. GENERATOR COG
 # ==========================================
 
+# ==========================================
+# 7. GENERATOR COG (UPDATED – TEXT LINKS ONLY)
+# ==========================================
+
 class GeneratorCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -826,18 +830,24 @@ class GeneratorCog(commands.Cog):
             # --- EXCLUDE ON-HOLD ACCOUNTS ---
             if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
                 print(f"[Gen] Skipping on-hold {tier} cookie (attempt {attempt+1})")
-                continue  # treat as dead, do not give to user
+                continue
 
             links = build_links_for_tier(nft["token"], tier)
 
-            # ── DM Embed with full details & login instructions ──
+            # ── Build the link list as plain text ──
+            link_lines = []
+            for label, url in links:
+                link_lines.append(f"{label}: {url}")
+            links_text = "\n".join(link_lines)
+
+            # ── DM Embed with full details (links included in description) ──
             dm_embed = discord.Embed(
                 title=f"{emoji} {label} Netflix Account",
                 description=(
                     "**📖 How to login:**\n"
-                    "Click the button below that matches your device. "
-                    "The link is **one‑time use** – open it immediately.\n"
-                    "If you need help, create a ticket in <#{TICKET_CHANNEL_ID}>."
+                    "Click the links below (they are **one‑time use**).\n"
+                    "If you need help, create a ticket in <#{TICKET_CHANNEL_ID}>.\n\n"
+                    f"{links_text}"
                 ),
                 color=discord.Color.red(),
             )
@@ -878,11 +888,9 @@ class GeneratorCog(commands.Cog):
 
             dm_embed.set_footer(text=f"{label} by INFOGAMER | Vouch in <#{VOUCH_CHANNEL_ID}>")
 
-            view = LoginView(links)
-
-            # Send DM to user
+            # Send DM to user (embed only, links are inside the description)
             try:
-                await interaction.user.send(embed=dm_embed, view=view)
+                await interaction.user.send(embed=dm_embed)
                 dm_success = True
             except discord.Forbidden:
                 dm_success = False
@@ -903,7 +911,7 @@ class GeneratorCog(commands.Cog):
             ephemeral_embed.set_footer(text=f"Expires: {nft.get('expires_at_utc', 'Unknown')} | One‑time use")
             await interaction.followup.send(embed=ephemeral_embed, ephemeral=True)
 
-            # ── Public success embed (refined, only shows who generated and a vouch reminder) ──
+            # ── Public success embed ──
             public_embed = discord.Embed(
                 title="🎉 Netflix Account Generated!",
                 description=(
@@ -955,6 +963,7 @@ class GeneratorCog(commands.Cog):
         file4: discord.Attachment | None = None,
         file5: discord.Attachment | None = None,
     ):
+        # restock code unchanged (keep as is)
         await interaction.response.defer(ephemeral=True)
 
         attachments = [f for f in (file1, file2, file3, file4, file5) if f is not None]
@@ -1015,7 +1024,6 @@ class GeneratorCog(commands.Cog):
                 if nid:
                     seen_ids.add(nid)
 
-        # Increase concurrency for faster restock processing
         SEM = asyncio.Semaphore(20)
 
         async def _check(cookie: str) -> dict:
@@ -1026,12 +1034,11 @@ class GeneratorCog(commands.Cog):
 
         sorted_: dict[str, list[str]] = {"free": [], "booster": [], "premium": []}
         dead = 0
-        on_hold = 0   # on‑hold counter (excluded from any tier)
+        on_hold = 0
 
         for cookie, res in zip(unique, results):
             if res["ok"]:
                 full_info = res.get("full_info", {})
-                # Skip on‑hold accounts – do not add to any tier
                 if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
                     on_hold += 1
                     continue
