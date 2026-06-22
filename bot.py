@@ -79,7 +79,7 @@ FGEN_CHANNEL_ID  = _int_env("FGEN_CHANNEL_ID")
 BGEN_CHANNEL_ID  = _int_env("BGEN_CHANNEL_ID")
 PGEN_CHANNEL_ID  = _int_env("PGEN_CHANNEL_ID")
 OWNER_ID         = int(os.environ.get("OWNER_ID", "1506365840273047714"))
-TICKET_CHANNEL_ID = 1516530741826289796
+TICKET_CHANNEL_ID = 1516530741826289796   # Updated ticket channel ID
 VOUCH_CHANNEL_ID  = 1516530704148598944   # Updated vouch channel ID
 
 # ==========================================
@@ -400,7 +400,7 @@ def _extract_html_info(text: str) -> dict:
         "holdStatus": _rx(text, r'"holdStatus"\s*:\s*(true|false)'),
         "emailVerified": _rx(text, r'"emailVerified"\s*:\s*(true|false)'),
         "membershipStatus": _rx(text, r'"membershipStatus":\s*"([^"]+)"'),
-        "profilesDisplay": _rx(text, r'"profileName"\s*:\s*"([^"]+)"'),  # simplified, will be overwritten if GraphQL present
+        "profilesDisplay": _rx(text, r'"profileName"\s*:\s*"([^"]+)"'),
         "userGuid": _rx(text, r'"userGuid":\s*"([^"]+)"'),
     }
     # Normalize boolean-like values
@@ -759,16 +759,6 @@ def build_links_for_tier(token: str, tier: str) -> list[tuple[str, str]]:
     return links
 
 # ==========================================
-# 5. LOGIN BUTTON VIEW
-# ==========================================
-
-class LoginView(discord.ui.View):
-    def __init__(self, links: list[tuple[str, str]]):
-        super().__init__(timeout=None)
-        for label, url in links:
-            self.add_item(discord.ui.Button(label=label, url=url, style=discord.ButtonStyle.link))
-
-# ==========================================
 # 6. CHANNEL GUARD
 # ==========================================
 
@@ -780,10 +770,6 @@ def in_channel(channel_id: int):
             raise app_commands.CheckFailure(f"❌ Use this command in <#{channel_id}>.")
         return True
     return app_commands.check(predicate)
-
-# ==========================================
-# 7. GENERATOR COG
-# ==========================================
 
 # ==========================================
 # 7. GENERATOR COG (UPDATED – TEXT LINKS ONLY)
@@ -963,7 +949,6 @@ class GeneratorCog(commands.Cog):
         file4: discord.Attachment | None = None,
         file5: discord.Attachment | None = None,
     ):
-        # restock code unchanged (keep as is)
         await interaction.response.defer(ephemeral=True)
 
         attachments = [f for f in (file1, file2, file3, file4, file5) if f is not None]
@@ -1090,7 +1075,7 @@ class GeneratorCog(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 # ==========================================
-# 8. BOT CLASS
+# 8. BOT CLASS (with anti‑429 fix)
 # ==========================================
 
 class NetflixBot(commands.Bot):
@@ -1102,25 +1087,19 @@ class NetflixBot(commands.Bot):
     async def setup_hook(self):
         await self.add_cog(GeneratorCog(self))
 
-        guild_id = os.environ.get("DISCORD_GUILD_ID", "").strip()
-        if guild_id:
-            try:
+        # Only sync if the FORCE_SYNC env variable is set to "true"
+        if os.environ.get("FORCE_SYNC", "").lower() == "true":
+            guild_id = os.environ.get("DISCORD_GUILD_ID", "").strip()
+            if guild_id:
                 g = discord.Object(id=int(guild_id))
-                self.tree.clear_commands(guild=g)
-                await self.tree.sync(guild=g)
                 self.tree.copy_global_to(guild=g)
                 await self.tree.sync(guild=g)
                 print(f"[Bot] Commands synced to guild {guild_id}.")
-                self.tree.clear_commands(guild=None)
+            else:
                 await self.tree.sync()
-                print("[Bot] Global ghost commands cleared.")
-            except Exception as e:
-                print(f"[Bot] Guild sync failed ({e}). Falling back to global.")
-                await self.tree.sync()
-                print("[Bot] Commands synced globally (up to 1 hour to appear).")
+                print("[Bot] Commands synced globally.")
         else:
-            await self.tree.sync()
-            print("[Bot] Commands synced globally (up to 1 hour to appear).")
+            print("[Bot] Skipping command sync (use FORCE_SYNC=true to re-sync).")
 
     async def on_ready(self):
         print(f"[Bot] ✅ Logged in as {self.user} (ID: {self.user.id})")
@@ -1174,7 +1153,7 @@ class NetflixBot(commands.Bot):
             await reply_embed(emb)
 
 # ==========================================
-# 9. ENTRY POINT
+# 9. ENTRY POINT (with retry logic for 429)
 # ==========================================
 
 def main():
@@ -1191,12 +1170,24 @@ def main():
         print(f"[Bot] Owner bypass enabled for ID: {OWNER_ID}")
 
     bot = NetflixBot()
-    try:
-        bot.run(token)
-    except discord.LoginFailure:
-        sys.exit("[Bot] FATAL: Invalid DISCORD_BOT_TOKEN.")
-    except Exception as e:
-        sys.exit(f"[Bot] FATAL: {e}")
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            bot.run(token)
+            break  # if run ends without 429, exit loop
+        except discord.LoginFailure:
+            sys.exit("[Bot] FATAL: Invalid DISCORD_BOT_TOKEN.")
+        except discord.HTTPException as e:
+            if e.status == 429:
+                retry_after = float(e.response.headers.get("Retry-After", 60))
+                wait = retry_after + 5
+                print(f"[Bot] Rate limited (429). Waiting {wait:.0f} seconds before retry...")
+                import time
+                time.sleep(wait)
+            else:
+                sys.exit(f"[Bot] FATAL HTTP error: {e}")
+        except Exception as e:
+            sys.exit(f"[Bot] FATAL: {e}")
 
 if __name__ == "__main__":
     main()
