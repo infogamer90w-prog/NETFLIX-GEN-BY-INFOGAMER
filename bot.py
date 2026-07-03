@@ -78,9 +78,10 @@ ADMIN_CHANNEL_ID = _int_env("ADMIN_CHANNEL_ID")
 FGEN_CHANNEL_ID  = _int_env("FGEN_CHANNEL_ID")
 BGEN_CHANNEL_ID  = _int_env("BGEN_CHANNEL_ID")
 PGEN_CHANNEL_ID  = _int_env("PGEN_CHANNEL_ID")
+RESTOCK_CHANNEL_ID = _int_env("RESTOCK_CHANNEL_ID")  # NEW
 OWNER_ID         = int(os.environ.get("OWNER_ID", "1506365840273047714"))
-TICKET_CHANNEL_ID = 1516530741826289796   # Updated ticket channel ID
-VOUCH_CHANNEL_ID  = 1516530704148598944   # Updated vouch channel ID
+TICKET_CHANNEL_ID = 1516530741826289796
+VOUCH_CHANNEL_ID  = 1516530704148598944
 
 # ==========================================
 # 1. SUPABASE CLOUD DATABASE
@@ -403,7 +404,6 @@ def _extract_html_info(text: str) -> dict:
         "profilesDisplay": _rx(text, r'"profileName"\s*:\s*"([^"]+)"'),
         "userGuid": _rx(text, r'"userGuid":\s*"([^"]+)"'),
     }
-    # Normalize boolean-like values
     for key in ("showExtraMemberSection", "holdStatus", "emailVerified"):
         val = info.get(key)
         if val is not None:
@@ -751,11 +751,11 @@ def build_links_for_tier(token: str, tier: str) -> list[tuple[str, str]]:
     t = _decode(token)
     if not t:
         return []
-    links = [("🖥️ PC Login", f"https://netflix.com/?nftoken={t}")]
+    links = [("🖥️ PC Login", f"[Click here to login](https://netflix.com/?nftoken={t})")]
     if tier in ("booster", "premium"):
-        links.append(("📱 Mobile Login", f"https://netflix.com/unsupported?nftoken={t}"))
+        links.append(("📱 Mobile Login", f"[Click here to login](https://netflix.com/unsupported?nftoken={t})"))
     if tier == "premium":
-        links.append(("📺 TV Login", f"https://netflix.com/tv8?nftoken={t}"))
+        links.append(("📺 TV Login", f"[Click here to login](https://netflix.com/tv8?nftoken={t})"))
     return links
 
 # ==========================================
@@ -772,7 +772,7 @@ def in_channel(channel_id: int):
     return app_commands.check(predicate)
 
 # ==========================================
-# 7. GENERATOR COG (UPDATED – TEXT LINKS ONLY)
+# 7. GENERATOR COG (UPDATED – ALL COMMANDS)
 # ==========================================
 
 class GeneratorCog(commands.Cog):
@@ -797,13 +797,14 @@ class GeneratorCog(commands.Cog):
 
             check = await loop.run_in_executor(None, check_nf_cookie, cookie)
             if not check["ok"]:
+                # FIXED: continue instead of return so we try next cookie
                 if "NFToken" in check.get("reason", ""):
                     await interaction.followup.send(
                         f"❌ Something went wrong while generating your account. "
                         f"Please open a ticket in <#{TICKET_CHANNEL_ID}> and report the problem.",
                         ephemeral=True,
                     )
-                    return
+                    continue   # <--- changed from return to continue
                 print(f"[Gen] Dead {tier} cookie (attempt {attempt+1}): {check.get('reason')}")
                 continue
 
@@ -813,26 +814,23 @@ class GeneratorCog(commands.Cog):
 
             full_info = check.get("full_info", {})
 
-            # --- EXCLUDE ON-HOLD ACCOUNTS ---
+            # EXCLUDE ON-HOLD ACCOUNTS
             if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
                 print(f"[Gen] Skipping on-hold {tier} cookie (attempt {attempt+1})")
                 continue
 
             links = build_links_for_tier(nft["token"], tier)
-
-            # ── Build the link list as plain text ──
             link_lines = []
             for label, url in links:
                 link_lines.append(f"{label}: {url}")
             links_text = "\n".join(link_lines)
 
-            # ── DM Embed with full details (links included in description) ──
             dm_embed = discord.Embed(
                 title=f"{emoji} {label} Netflix Account",
                 description=(
                     "**📖 How to login:**\n"
                     "Click the links below (they are **one‑time use**).\n"
-                    "If you need help, create a ticket in <#{TICKET_CHANNEL_ID}>.\n\n"
+                    "If you need help, create a ticket in <#TICKET_CHANNEL_ID>.\n\n"
                     f"{links_text}"
                 ),
                 color=discord.Color.red(),
@@ -874,7 +872,6 @@ class GeneratorCog(commands.Cog):
 
             dm_embed.set_footer(text=f"{label} by INFOGAMER | Vouch in <#{VOUCH_CHANNEL_ID}>")
 
-            # Send DM to user (embed only, links are inside the description)
             try:
                 await interaction.user.send(embed=dm_embed)
                 dm_success = True
@@ -888,7 +885,6 @@ class GeneratorCog(commands.Cog):
                 )
                 return
 
-            # Ephemeral success embed (shown only to the command user)
             ephemeral_embed = discord.Embed(
                 title=f"{emoji} {label} Netflix Generated!",
                 description="Account details have been sent to your DMs. Check your DM for login links.",
@@ -897,7 +893,6 @@ class GeneratorCog(commands.Cog):
             ephemeral_embed.set_footer(text=f"Expires: {nft.get('expires_at_utc', 'Unknown')} | One‑time use")
             await interaction.followup.send(embed=ephemeral_embed, ephemeral=True)
 
-            # ── Public success embed ──
             public_embed = discord.Embed(
                 title="🎉 Netflix Account Generated!",
                 description=(
@@ -915,7 +910,6 @@ class GeneratorCog(commands.Cog):
             ephemeral=True,
         )
 
-    # ── generation commands with owner bypass via dynamic key ──
     @app_commands.command(name="fgen", description="🆓 Generate a Free Netflix account")
     @in_channel(FGEN_CHANNEL_ID)
     @app_commands.checks.cooldown(1, 86400, key=lambda i: i.user.id if i.user.id != OWNER_ID else object())
@@ -1053,9 +1047,23 @@ class GeneratorCog(commands.Cog):
         embed.add_field(name="♻️ Duplicates Skipped", value=f"`{dupes}`",               inline=True)
         embed.add_field(name="⏸️ On Hold Skipped", value=f"`{on_hold}`",                 inline=True)
         embed.add_field(name="📊 Total Scanned",   value=f"`{len(all_accounts)}`",       inline=True)
+        embed.add_field(name="👤 Restocked by",    value=interaction.user.mention,       inline=False)  # NEW
         if not ok:
             embed.add_field(name="⚠️ Warning", value="Supabase write may have failed.", inline=False)
-        await interaction.followup.send(embed=embed)
+
+        await interaction.followup.send(embed=embed)  # ephemeral to admin
+
+        # --- SEND TO RESTOCK CHANNEL ---
+        restock_channel = self.bot.get_channel(RESTOCK_CHANNEL_ID)
+        if restock_channel:
+            try:
+                await restock_channel.send(embed=embed)
+            except Exception as e:
+                await interaction.followup.send(
+                    f"⚠️ Failed to notify restock channel: {e}",
+                    ephemeral=True
+                )
+        # ---------------------------------
 
     @app_commands.command(name="stock", description="📦 Check Netflix account stock levels")
     @in_channel(ADMIN_CHANNEL_ID)
@@ -1074,6 +1082,174 @@ class GeneratorCog(commands.Cog):
         embed.set_footer(text=f"Total: {sum(counts.values())} accounts")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+    # =====================
+    # NEW: /removecookies
+    # =====================
+    @app_commands.command(
+        name="removecookies",
+        description="[ADMIN] Remove cookies from the vault by uploading a file with the cookies to delete"
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    @in_channel(ADMIN_CHANNEL_ID)
+    async def removecookies(
+        self,
+        interaction: discord.Interaction,
+        file: discord.Attachment
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        if not file.filename.lower().endswith((".txt", ".json")):
+            return await interaction.followup.send(
+                "❌ Only `.txt` / `.json` files are accepted.",
+                ephemeral=True
+            )
+
+        try:
+            raw_bytes = await file.read()
+            raw = raw_bytes.decode("utf-8", errors="ignore")
+        except Exception as e:
+            return await interaction.followup.send(
+                f"❌ Could not read `{file.filename}`: {e}",
+                ephemeral=True
+            )
+
+        accounts = parse_cookie_file(raw)
+        if not accounts:
+            return await interaction.followup.send(
+                "❌ No valid Netflix cookies found in the file.",
+                ephemeral=True
+            )
+
+        ids_to_remove = set()
+        for cookie_text in accounts:
+            nid = netscape_to_dict(cookie_text).get("NetflixId", "").strip()
+            if nid:
+                ids_to_remove.add(nid)
+
+        if not ids_to_remove:
+            return await interaction.followup.send(
+                "❌ No NetflixId could be extracted from the uploaded cookies.",
+                ephemeral=True
+            )
+
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(None, db.get_all)
+        removed_count = 0
+        for tier in ("free", "booster", "premium"):
+            original = data["nf"][tier]
+            new_list = []
+            for cookie_text in original:
+                nid = netscape_to_dict(cookie_text).get("NetflixId", "").strip()
+                if nid in ids_to_remove:
+                    removed_count += 1
+                else:
+                    new_list.append(cookie_text)
+            data["nf"][tier] = new_list
+
+        if removed_count == 0:
+            return await interaction.followup.send(
+                "ℹ️ No matching cookies found in the vault.",
+                ephemeral=True
+            )
+
+        success = await loop.run_in_executor(None, db.save, data)
+        status = "✅" if success else "⚠️ (save may have failed)"
+
+        embed = discord.Embed(
+            title="🗑️ Cookies Removed",
+            description=f"{status} Removed **{removed_count}** account(s) from the vault.",
+            color=discord.Color.orange() if not success else discord.Color.green()
+        )
+        embed.add_field(name="📂 File", value=file.filename, inline=False)
+        embed.add_field(name="🔑 NetflixIds to remove", value=f"`{len(ids_to_remove)}` unique", inline=True)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # =====================
+    # NEW: /exportandclear
+    # =====================
+    @app_commands.command(
+        name="exportandclear",
+        description="[ADMIN] Export all vault cookies (tier-wise zip) and then empty the entire vault"
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    @in_channel(ADMIN_CHANNEL_ID)
+    async def exportandclear(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(None, db.get_all)
+
+        # Prepare tier-wise cookies
+        tiers = {
+            "free": data["nf"].get("free", []),
+            "booster": data["nf"].get("booster", []),
+            "premium": data["nf"].get("premium", []),
+        }
+        total = sum(len(v) for v in tiers.values())
+        if total == 0:
+            return await interaction.followup.send("❌ The vault is already empty.", ephemeral=True)
+
+        # Build zip in memory
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for tier_name, cookies in tiers.items():
+                if cookies:
+                    content = "\n\n".join(cookies)
+                    zf.writestr(f"{tier_name}.txt", content)
+
+        zip_buffer.seek(0)
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        file = discord.File(
+            fp=zip_buffer,
+            filename=f"vault_export_{timestamp}.zip",
+            description="Full vault export (tier-wise)"
+        )
+
+        # Send DM to admin
+        try:
+            await interaction.user.send(
+                f"📦 **Vault Export**\n"
+                f"Total accounts: **{total}**\n"
+                f"Breakdown: Premium {len(tiers['premium'])}, Booster {len(tiers['booster'])}, Free {len(tiers['free'])}\n"
+                f"Attached zip contains separate text files for each tier.",
+                file=file
+            )
+            dm_ok = True
+        except discord.Forbidden:
+            dm_ok = False
+
+        if not dm_ok:
+            return await interaction.followup.send(
+                "❌ I couldn't DM you. Please enable DMs and try again.",
+                ephemeral=True
+            )
+
+        # Clear vault
+        for t in ("free", "booster", "premium"):
+            data["nf"][t] = []
+        success = await loop.run_in_executor(None, db.save, data)
+
+        embed = discord.Embed(
+            title="🗑️ Vault Cleared",
+            description=f"✅ **{total}** account(s) removed. Zip sent to your DMs.",
+            color=discord.Color.green() if success else discord.Color.orange()
+        )
+        if not success:
+            embed.add_field(name="⚠️ Warning", value="Supabase write may have failed.")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+        # Optional log to restock channel
+        log_ch = self.bot.get_channel(RESTOCK_CHANNEL_ID)
+        if log_ch:
+            try:
+                await log_ch.send(
+                    f"🗑️ **Vault cleared** by {interaction.user.mention} — {total} accounts removed."
+                )
+            except Exception:
+                pass
+
+
 # ==========================================
 # 8. BOT CLASS (with anti‑429 fix)
 # ==========================================
@@ -1087,7 +1263,6 @@ class NetflixBot(commands.Bot):
     async def setup_hook(self):
         await self.add_cog(GeneratorCog(self))
 
-        # Only sync if the FORCE_SYNC env variable is set to "true"
         if os.environ.get("FORCE_SYNC", "").lower() == "true":
             guild_id = os.environ.get("DISCORD_GUILD_ID", "").strip()
             if guild_id:
@@ -1152,6 +1327,7 @@ class NetflixBot(commands.Bot):
             emb = discord.Embed(description=f"⚠️ Unexpected error: `{type(error).__name__}`", color=discord.Color.red())
             await reply_embed(emb)
 
+
 # ==========================================
 # 9. ENTRY POINT (with retry logic for 429)
 # ==========================================
@@ -1165,7 +1341,7 @@ def main():
 
     print("[Bot] Starting Netflix Discord Bot…")
     print(f"[Bot] Channels — ADMIN:{ADMIN_CHANNEL_ID} FGEN:{FGEN_CHANNEL_ID} "
-          f"BGEN:{BGEN_CHANNEL_ID} PGEN:{PGEN_CHANNEL_ID}")
+          f"BGEN:{BGEN_CHANNEL_ID} PGEN:{PGEN_CHANNEL_ID} RESTOCK:{RESTOCK_CHANNEL_ID}")
     if OWNER_ID:
         print(f"[Bot] Owner bypass enabled for ID: {OWNER_ID}")
 
@@ -1174,7 +1350,7 @@ def main():
     for attempt in range(max_retries):
         try:
             bot.run(token)
-            break  # if run ends without 429, exit loop
+            break
         except discord.LoginFailure:
             sys.exit("[Bot] FATAL: Invalid DISCORD_BOT_TOKEN.")
         except discord.HTTPException as e:
