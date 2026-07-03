@@ -10,6 +10,7 @@ import threading
 import unicodedata
 import warnings
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 # Suppress SyntaxWarnings from discord.py 2.x under Python 3.14+
@@ -78,7 +79,7 @@ ADMIN_CHANNEL_ID = _int_env("ADMIN_CHANNEL_ID")
 FGEN_CHANNEL_ID  = _int_env("FGEN_CHANNEL_ID")
 BGEN_CHANNEL_ID  = _int_env("BGEN_CHANNEL_ID")
 PGEN_CHANNEL_ID  = _int_env("PGEN_CHANNEL_ID")
-RESTOCK_CHANNEL_ID = _int_env("RESTOCK_CHANNEL_ID")  # NEW
+RESTOCK_CHANNEL_ID = _int_env("RESTOCK_CHANNEL_ID")
 OWNER_ID         = int(os.environ.get("OWNER_ID", "1506365840273047714"))
 TICKET_CHANNEL_ID = 1516530741826289796
 VOUCH_CHANNEL_ID  = 1516530704148598944
@@ -772,8 +773,11 @@ def in_channel(channel_id: int):
     return app_commands.check(predicate)
 
 # ==========================================
-# 7. GENERATOR COG (UPDATED – ALL COMMANDS)
+# 7. GENERATOR COG (UPDATED WITH FAST RESTOCK & CUSTOM NOTIFICATION)
 # ==========================================
+
+# Restock channel notification image URL - change this to your desired image
+RESTOCK_IMAGE_URL = "https://drive.google.com/file/d/1XfkCzgKixfwH7QJ332YnG--NTI8aTv5D/view?usp=drive_link"   # <-- replace with actual image link
 
 class GeneratorCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -797,14 +801,13 @@ class GeneratorCog(commands.Cog):
 
             check = await loop.run_in_executor(None, check_nf_cookie, cookie)
             if not check["ok"]:
-                # FIXED: continue instead of return so we try next cookie
                 if "NFToken" in check.get("reason", ""):
                     await interaction.followup.send(
                         f"❌ Something went wrong while generating your account. "
                         f"Please open a ticket in <#{TICKET_CHANNEL_ID}> and report the problem.",
                         ephemeral=True,
                     )
-                    continue   # <--- changed from return to continue
+                    continue
                 print(f"[Gen] Dead {tier} cookie (attempt {attempt+1}): {check.get('reason')}")
                 continue
 
@@ -814,7 +817,6 @@ class GeneratorCog(commands.Cog):
 
             full_info = check.get("full_info", {})
 
-            # EXCLUDE ON-HOLD ACCOUNTS
             if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
                 print(f"[Gen] Skipping on-hold {tier} cookie (attempt {attempt+1})")
                 continue
@@ -830,7 +832,7 @@ class GeneratorCog(commands.Cog):
                 description=(
                     "**📖 How to login:**\n"
                     "Click the links below (they are **one‑time use**).\n"
-                    "If you need help, create a ticket in <#TICKET_CHANNEL_ID>.\n\n"
+                    "If you need help, create a ticket in <#1516530741826289796>.\n\n"
                     f"{links_text}"
                 ),
                 color=discord.Color.red(),
@@ -984,15 +986,18 @@ class GeneratorCog(commands.Cog):
                 ephemeral=True,
             )
 
+        # Progress message
         await interaction.followup.send(
             f"⏳ Scanning **{len(all_accounts)}** cookie(s) from **{len(attachments)}** file(s)… Please wait.",
             ephemeral=True,
         )
 
         loop = asyncio.get_running_loop()
+
+        # Deduplicate against existing IDs
         existing_ids: set[str] = await loop.run_in_executor(None, db.existing_netflix_ids)
-        seen_ids:     set[str] = set(existing_ids)
-        unique:       list[str] = []
+        seen_ids = set(existing_ids)
+        unique = []
         dupes = 0
         for cookie in all_accounts:
             nid = netscape_to_dict(cookie).get("NetflixId", "").strip()
@@ -1003,15 +1008,25 @@ class GeneratorCog(commands.Cog):
                 if nid:
                     seen_ids.add(nid)
 
-        SEM = asyncio.Semaphore(20)
+        # -------------------------------
+        # HIGH-PERFORMANCE PARALLEL CHECK
+        # -------------------------------
+        MAX_WORKERS = 150   # threads for heavy I/O
+        SEM_LIMIT   = 150   # asyncio semaphore
+        executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        sem = asyncio.Semaphore(SEM_LIMIT)
 
         async def _check(cookie: str) -> dict:
-            async with SEM:
-                return await loop.run_in_executor(None, check_nf_cookie, cookie)
+            async with sem:
+                return await loop.run_in_executor(executor, check_nf_cookie, cookie)
 
-        results = await asyncio.gather(*[_check(c) for c in unique])
+        try:
+            results = await asyncio.gather(*[_check(c) for c in unique])
+        finally:
+            executor.shutdown(wait=False)
 
-        sorted_: dict[str, list[str]] = {"free": [], "booster": [], "premium": []}
+        # Sort results
+        sorted_cookies = {"free": [], "booster": [], "premium": []}
         dead = 0
         on_hold = 0
 
@@ -1022,48 +1037,71 @@ class GeneratorCog(commands.Cog):
                     on_hold += 1
                     continue
                 tier = classify_tier(res.get("plan", ""), res.get("quality", ""))
-                sorted_[tier].append(cookie)
+                sorted_cookies[tier].append(cookie)
             else:
                 dead += 1
 
+        # Save to DB
         data = await loop.run_in_executor(None, db.get_all)
         for t in ("free", "booster", "premium"):
-            data["nf"][t].extend(sorted_[t])
-        ok = await loop.run_in_executor(None, db.save, data)
+            data["nf"][t].extend(sorted_cookies[t])
+        save_ok = await loop.run_in_executor(None, db.save, data)
 
+        # Get final stock counts
+        final_stock = await loop.run_in_executor(None, db.stock)
+
+        # ===================================
+        # ADMIN EPHEMERAL EMBED (unchanged)
+        # ===================================
         files_value = "\n".join(file_names)
         if len(files_value) > 900:
             files_value = files_value[:900] + "\n…"
 
-        embed = discord.Embed(
+        admin_embed = discord.Embed(
             title="✅ Restock Complete — Auto-sorted",
-            color=discord.Color.green() if ok else discord.Color.orange(),
+            color=discord.Color.green() if save_ok else discord.Color.orange(),
         )
-        embed.add_field(name="📂 Files",           value=files_value,                    inline=False)
-        embed.add_field(name="💎 Premium Added",   value=f"`{len(sorted_['premium'])}`", inline=True)
-        embed.add_field(name="🚀 Booster Added",   value=f"`{len(sorted_['booster'])}`", inline=True)
-        embed.add_field(name="🆓 Free Added",      value=f"`{len(sorted_['free'])}`",    inline=True)
-        embed.add_field(name="💀 Dead Filtered",   value=f"`{dead}`",                    inline=True)
-        embed.add_field(name="♻️ Duplicates Skipped", value=f"`{dupes}`",               inline=True)
-        embed.add_field(name="⏸️ On Hold Skipped", value=f"`{on_hold}`",                 inline=True)
-        embed.add_field(name="📊 Total Scanned",   value=f"`{len(all_accounts)}`",       inline=True)
-        embed.add_field(name="👤 Restocked by",    value=interaction.user.mention,       inline=False)  # NEW
-        if not ok:
-            embed.add_field(name="⚠️ Warning", value="Supabase write may have failed.", inline=False)
+        admin_embed.add_field(name="📂 Files",           value=files_value,                    inline=False)
+        admin_embed.add_field(name="💎 Premium Added",   value=f"`{len(sorted_cookies['premium'])}`", inline=True)
+        admin_embed.add_field(name="🚀 Booster Added",   value=f"`{len(sorted_cookies['booster'])}`", inline=True)
+        admin_embed.add_field(name="🆓 Free Added",      value=f"`{len(sorted_cookies['free'])}`",    inline=True)
+        admin_embed.add_field(name="💀 Dead Filtered",   value=f"`{dead}`",                    inline=True)
+        admin_embed.add_field(name="♻️ Duplicates Skipped", value=f"`{dupes}`",               inline=True)
+        admin_embed.add_field(name="⏸️ On Hold Skipped", value=f"`{on_hold}`",                 inline=True)
+        admin_embed.add_field(name="📊 Total Scanned",   value=f"`{len(all_accounts)}`",       inline=True)
+        admin_embed.add_field(name="👤 Restocked by",    value=interaction.user.mention,       inline=False)
+        if not save_ok:
+            admin_embed.add_field(name="⚠️ Warning", value="Supabase write may have failed.", inline=False)
 
-        await interaction.followup.send(embed=embed)  # ephemeral to admin
+        await interaction.followup.send(embed=admin_embed)  # stays ephemeral
 
-        # --- SEND TO RESTOCK CHANNEL ---
+        # ===================================
+        # PUBLIC RESTOCK CHANNEL EMBED (NEW)
+        # ===================================
         restock_channel = self.bot.get_channel(RESTOCK_CHANNEL_ID)
         if restock_channel:
+            pub_embed = discord.Embed(
+                title="✅ Netflix Restock Successfully",
+                description=(
+                    f"*🆓 Free Stock added = {len(sorted_cookies['free'])}*\n"
+                    f"*🌟 Boosters Stock added = {len(sorted_cookies['booster'])}*\n"
+                    f"*👑 Premium Stock added = {len(sorted_cookies['premium'])}*\n\n"
+                    f"**Total Stock**\n"
+                    f"*🆓 Free Stock = {final_stock['free']}*\n"
+                    f"*🌟 Boosters Stock = {final_stock['booster']}*\n"
+                    f"*👑 Premium Stock = {final_stock['premium']}*"
+                ),
+                color=0xd2af26,   # requested color
+            )
+            pub_embed.set_footer(text="⚠️ All Accounts Working With No Errors")
+            pub_embed.set_image(url=RESTOCK_IMAGE_URL)
             try:
-                await restock_channel.send(embed=embed)
+                await restock_channel.send(embed=pub_embed)
             except Exception as e:
                 await interaction.followup.send(
                     f"⚠️ Failed to notify restock channel: {e}",
                     ephemeral=True
                 )
-        # ---------------------------------
 
     @app_commands.command(name="stock", description="📦 Check Netflix account stock levels")
     @in_channel(ADMIN_CHANNEL_ID)
@@ -1083,7 +1121,7 @@ class GeneratorCog(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     # =====================
-    # NEW: /removecookies
+    # /removecookies
     # =====================
     @app_commands.command(
         name="removecookies",
@@ -1166,7 +1204,7 @@ class GeneratorCog(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     # =====================
-    # NEW: /exportandclear
+    # /exportandclear
     # =====================
     @app_commands.command(
         name="exportandclear",
@@ -1180,7 +1218,6 @@ class GeneratorCog(commands.Cog):
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(None, db.get_all)
 
-        # Prepare tier-wise cookies
         tiers = {
             "free": data["nf"].get("free", []),
             "booster": data["nf"].get("booster", []),
@@ -1190,7 +1227,6 @@ class GeneratorCog(commands.Cog):
         if total == 0:
             return await interaction.followup.send("❌ The vault is already empty.", ephemeral=True)
 
-        # Build zip in memory
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for tier_name, cookies in tiers.items():
@@ -1206,7 +1242,6 @@ class GeneratorCog(commands.Cog):
             description="Full vault export (tier-wise)"
         )
 
-        # Send DM to admin
         try:
             await interaction.user.send(
                 f"📦 **Vault Export**\n"
@@ -1225,7 +1260,6 @@ class GeneratorCog(commands.Cog):
                 ephemeral=True
             )
 
-        # Clear vault
         for t in ("free", "booster", "premium"):
             data["nf"][t] = []
         success = await loop.run_in_executor(None, db.save, data)
@@ -1239,7 +1273,6 @@ class GeneratorCog(commands.Cog):
             embed.add_field(name="⚠️ Warning", value="Supabase write may have failed.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-        # Optional log to restock channel
         log_ch = self.bot.get_channel(RESTOCK_CHANNEL_ID)
         if log_ch:
             try:
