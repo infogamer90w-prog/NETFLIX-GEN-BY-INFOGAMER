@@ -1065,12 +1065,9 @@ class GeneratorCog(commands.Cog):
 
         await progress_msg.edit(content=None, embed=admin_embed)
 
-        # Public restock channel embed (unchanged)
+        # ---------- PUBLIC RESTOCK CHANNEL EMBED (NO FILES) ----------
         restock_channel = self.bot.get_channel(RESTOCK_CHANNEL_ID)
         if restock_channel:
-            pub_file_list = "\n".join(file_names).replace("cookies", "accounts")
-            if len(pub_file_list) > 900:
-                pub_file_list = pub_file_list[:900] + "\n…"
             pub_embed = discord.Embed(
                 title="✅ Netflix Restock Successfully",
                 color=0xd2af26,
@@ -1090,7 +1087,7 @@ class GeneratorCog(commands.Cog):
             pub_embed.add_field(name="💀 Dead", value=f"`{dead}`", inline=True)
             pub_embed.add_field(name="♻️ Dupes", value=f"`{dupes}`", inline=True)
             pub_embed.add_field(name="⏸️ On Hold", value=f"`{on_hold}`", inline=True)
-            pub_embed.add_field(name="📂 Files", value=pub_file_list, inline=False)
+            # No 📂 Files field – file names stay private
             pub_embed.set_footer(text="⚠️ All Accounts Working With No Errors")
             pub_embed.set_image(url=RESTOCK_IMAGE_URL)
             try:
