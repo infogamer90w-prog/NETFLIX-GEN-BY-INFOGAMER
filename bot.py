@@ -32,7 +32,6 @@ warnings.filterwarnings("ignore", message=r".*message content intent.*", categor
 # ==========================================
 def _start_fake_server():
     port = int(os.environ.get("PORT", "10000"))
-
     class _Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             body = b"OK"
@@ -41,16 +40,13 @@ def _start_fake_server():
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-
         def do_HEAD(self):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", "2")
             self.end_headers()
-
         def log_message(self, *args):
             pass
-
     server = http.server.HTTPServer(("0.0.0.0", port), _Handler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -473,6 +469,36 @@ def create_nftoken_fast(cookie_text: str) -> tuple[dict | None, str | None]:
     except Exception as e:
         return None, str(e)
 
+# ------------------------------------------------
+# normalize_plan_key (MUST be defined before use)
+# ------------------------------------------------
+def normalize_plan_key(value: str | None) -> str:
+    if not value:
+        return "unknown"
+    simplified = unicodedata.normalize("NFKD", str(value))
+    simplified = "".join(ch for ch in simplified if not unicodedata.combining(ch))
+    normalized = re.sub(r"[^\w]+", "_", simplified.lower(), flags=re.UNICODE).strip("_")
+    return normalized or "unknown"
+
+# Tier classification constants
+_PREMIUM_PLAN_KEYS = {"premium", "premium_extra_member", "extra_member_premium", "cao_cap", "ozel", "프리미엄", "プレミアム"}
+_BOOSTER_PLAN_KEYS = {"standard", "standard_with_ads", "estandar", "estandar_con_anuncios", "padrao", "standaard", "standardowy", "standardowy_z_reklamami", "standar", "standart", "スタンダード", "스탠다드"}
+
+def classify_tier(plan: str, quality: str) -> str:
+    if not plan and not quality:
+        return "free"
+    key_p = normalize_plan_key(plan or "")
+    q_up = (quality or "").upper()
+    if q_up in ("UHD", "4K") or "UHD" in q_up or "4K" in q_up:
+        return "premium"
+    if key_p in _PREMIUM_PLAN_KEYS or "premium" in key_p:
+        return "premium"
+    if key_p in _BOOSTER_PLAN_KEYS or "standard" in key_p:
+        return "booster"
+    if q_up == "HIGH" or "1080" in q_up or "FHD" in q_up:
+        return "booster"
+    return "free"
+
 # ==========================================
 # FAST CHECKER (for restocking – minimal)
 # ==========================================
@@ -536,16 +562,6 @@ def check_nf_cookie_fast(cookie_text: str) -> dict:
 # ==========================================
 # FULL CHECKER (for generation – all details)
 # ==========================================
-# (The following functions are directly from your original bot, kept for the DM embed)
-
-def normalize_plan_key(value: str | None) -> str:
-    if not value:
-        return "unknown"
-    simplified = unicodedata.normalize("NFKD", str(value))
-    simplified = "".join(ch for ch in simplified if not unicodedata.combining(ch))
-    normalized = re.sub(r"[^\w]+", "_", simplified.lower(), flags=re.UNICODE).strip("_")
-    return normalized or "unknown"
-
 def _rx(text: str, *patterns: str, flags: int = 0) -> str | None:
     for pat in patterns:
         m = re.search(pat, text, flags)
@@ -800,7 +816,8 @@ def _is_subscribed(info: dict) -> bool:
         return True
     if info.get("showExtraMemberSection") == "Yes":
         return True
-    if any(re.search(p, info.get("raw_text", ""), re.IGNORECASE) for p in _EXTRA_MEMBER_PATTERNS):
+    raw = info.get("raw_text", "")
+    if any(re.search(p, raw, re.IGNORECASE) for p in _EXTRA_MEMBER_PATTERNS):
         return True
     return False
 
@@ -875,7 +892,7 @@ def build_links_for_tier(token: str, tier: str) -> list[tuple[str, str]]:
         links.append(("📺 TV Login", f"[Click here](https://netflix.com/tv8?nftoken={t})"))
     return links
 # ==========================================
-# 6. CHANNEL GUARD
+# CHANNEL GUARD
 # ==========================================
 def in_channel(channel_id: int):
     def predicate(interaction: discord.Interaction) -> bool:
@@ -886,7 +903,7 @@ def in_channel(channel_id: int):
         return True
     return app_commands.check(predicate)
 
-RESTOCK_IMAGE_URL = "https://kommodo.ai/i/tiDLkbEgU1zCoG3BF16m"   # <-- replace with your actual image
+RESTOCK_IMAGE_URL = "https://i.imgur.com/your_image.png"   # <-- replace with your actual image
 
 class GeneratorCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -1359,7 +1376,7 @@ class GeneratorCog(commands.Cog):
                 pass
 
 # ==========================================
-# 8. BOT CLASS
+# BOT CLASS
 # ==========================================
 class NetflixBot(commands.Bot):
     def __init__(self):
@@ -1430,7 +1447,7 @@ class NetflixBot(commands.Bot):
             await reply_embed(emb)
 
 # ==========================================
-# 9. ENTRY POINT (with retry logic for 429)
+# ENTRY POINT (with retry logic for 429)
 # ==========================================
 def main():
     token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
