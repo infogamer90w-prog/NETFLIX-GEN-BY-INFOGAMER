@@ -7,7 +7,6 @@ import os
 import re
 import sys
 import threading
-import traceback
 import unicodedata
 import warnings
 import zipfile
@@ -499,9 +498,10 @@ def classify_tier(plan: str, quality: str) -> str:
     return "free"
 
 # ==========================================
-# FAST CHECKER (for restocking – minimal)
+# FAST CHECKER (for restocking – minimal, no proxies)
 # ==========================================
 def check_nf_cookie_fast(cookie_text: str) -> dict:
+    """Returns dict: ok, plan, quality, country, reason (if not ok)"""
     cookies = netscape_to_dict(cookie_text)
     if "NetflixId" not in cookies:
         return {"ok": False, "reason": "Missing NetflixId cookie."}
@@ -820,6 +820,7 @@ def _is_subscribed(info: dict) -> bool:
     return False
 
 def check_nf_cookie_full(cookie_text: str) -> dict:
+    """Full detailed checker, returns the same dict as original bot."""
     cookies = netscape_to_dict(cookie_text)
     if "NetflixId" not in cookies:
         return {"ok": False, "reason": "Missing NetflixId cookie."}
@@ -906,7 +907,6 @@ class GeneratorCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    # ---------- Helper to safely send error embeds ----------
     async def _send_error(self, interaction: discord.Interaction, message: str):
         try:
             if interaction.response.is_done():
@@ -926,7 +926,7 @@ class GeneratorCog(commands.Cog):
             return
 
         loop = asyncio.get_running_loop()
-        cookie = None  # track cookie for pushback on failure
+        cookie = None
 
         try:
             for attempt in range(5):
@@ -945,21 +945,20 @@ class GeneratorCog(commands.Cog):
                 try:
                     check = await loop.run_in_executor(None, check_nf_cookie_full, cookie)
                 except Exception as e:
-                    print(f"[Gen] Check error: {e}\n{traceback.format_exc()}")
+                    print(f"[Gen] Check error: {e}")
+                    import traceback
+                    traceback.print_exc()
                     await self._send_error(interaction, "❌ Error checking the account. Please try again.")
-                    # Push cookie back because we couldn't evaluate it
                     await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
                     return
 
                 if not check["ok"]:
                     if "NFToken" in check.get("reason", ""):
-                        # Valid cookie but NFToken failed -> push back
                         await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
                         await self._send_error(interaction,
                             f"❌ Something went wrong while generating your account. "
                             f"Please open a ticket in <#{TICKET_CHANNEL_ID}> and report the problem.")
                         continue
-                    # Dead cookie – discard
                     continue
 
                 nft = check.get("nft")
@@ -968,9 +967,8 @@ class GeneratorCog(commands.Cog):
 
                 full_info = check.get("full_info", {})
                 if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
-                    continue  # On-hold – discard
+                    continue
 
-                # Everything from here is wrapped to catch unexpected errors
                 try:
                     links = build_links_for_tier(nft["token"], tier)
                     link_lines = [f"{lbl}: {url}" for lbl, url in links]
@@ -1055,21 +1053,23 @@ class GeneratorCog(commands.Cog):
                         color=discord.Color.green(),
                     )
                     await interaction.followup.send(embed=public_embed, ephemeral=False)
-                    return  # success
+                    return
 
                 except Exception as build_err:
-                    print(f"[Gen] Build/send error: {build_err}\n{traceback.format_exc()}")
-                    # Push cookie back because we couldn't deliver
+                    print(f"[Gen] Build/send error: {build_err}")
+                    import traceback
+                    traceback.print_exc()
                     await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
                     await self._send_error(interaction, "❌ An unexpected error occurred while preparing your account. Please try again.")
                     return
 
-            # If loop ends without returning, all cookies were dead
             await self._send_error(interaction, "❌ All available cookies were expired. Ask an admin to `/restock`!")
 
         except Exception as outer_err:
-            print(f"[Gen] Unexpected outer error: {outer_err}\n{traceback.format_exc()}")
-            if cookie:  # try to return the last cookie if it was popped
+            print(f"[Gen] Unexpected outer error: {outer_err}")
+            import traceback
+            traceback.print_exc()
+            if cookie:
                 await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
             await self._send_error(interaction, "❌ An unexpected error occurred. Please try again later.")
 
@@ -1091,7 +1091,7 @@ class GeneratorCog(commands.Cog):
     async def pgen(self, interaction: discord.Interaction):
         await self._generate(interaction, "premium", "Premium", "💎")
 
-    # ---------- RESTOCK (uses FAST checker) ----------
+    # ---------- RESTOCK (uses FAST checker, no proxies, 50 threads) ----------
     @app_commands.command(
         name="restock",
         description="[ADMIN] Upload up to 5 files (.txt/.json/.zip) — auto-extracted, checked & sorted"
@@ -1181,8 +1181,8 @@ class GeneratorCog(commands.Cog):
         progress_embed.set_footer(text="Please wait…")
         progress_msg = await interaction.followup.send(embed=progress_embed, ephemeral=True)
 
-        MAX_WORKERS = 100
-        SEM_LIMIT = 100
+        MAX_WORKERS = 50   # as requested
+        SEM_LIMIT = 50
         executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
         sem = asyncio.Semaphore(SEM_LIMIT)
         completed = 0
@@ -1190,8 +1190,12 @@ class GeneratorCog(commands.Cog):
 
         async def _check(cookie_text, fname):
             nonlocal completed
-            async with sem:
-                res = await loop.run_in_executor(executor, check_nf_cookie_fast, cookie_text)
+            try:
+                async with sem:
+                    res = await loop.run_in_executor(executor, check_nf_cookie_fast, cookie_text)
+            except Exception as check_err:
+                # If an individual check fails completely, treat as dead
+                res = {"ok": False, "reason": str(check_err)}
             async with lock:
                 nonlocal completed
                 completed += 1
@@ -1207,13 +1211,22 @@ class GeneratorCog(commands.Cog):
                     await progress_msg.edit(embed=new_embed)
             return res
 
+        # Gather all checks, but handle any outer error gracefully
+        results = []
         try:
             results = await asyncio.gather(*[_check(cookie, fname) for cookie, fname in unique_cookies])
-        except Exception as e:
-            print(f"[Restock] Gather error: {e}\n{traceback.format_exc()}")
-            await self._send_error(interaction, "❌ An error occurred during checking. Please try again.")
-            executor.shutdown(wait=False)
-            return
+        except Exception as gather_err:
+            print(f"[Restock] Gather error: {gather_err}")
+            import traceback
+            traceback.print_exc()
+            # Continue with whatever results we have (they'll be incomplete)
+            # We'll create a partial result for missing ones as dead
+            results = [r if r is not None else {"ok": False, "reason": "check failed"}
+                       for r in (results if results else [])]
+            # If we have fewer results than tasks, fill the rest with dead
+            while len(results) < total:
+                results.append({"ok": False, "reason": "check failed"})
+
         executor.shutdown(wait=False)
 
         sorted_cookies = {"free": [], "booster": [], "premium": []}
@@ -1293,7 +1306,7 @@ class GeneratorCog(commands.Cog):
             embed.set_footer(text=f"Total: {sum(counts.values())} accounts")
             await interaction.followup.send(embed=embed, ephemeral=True)
         except Exception as e:
-            print(f"[Stock] Error: {e}\n{traceback.format_exc()}")
+            print(f"[Stock] Error: {e}")
             await self._send_error(interaction, "❌ Could not retrieve stock levels. Please try again.")
 
     # ---------- /removecookies ----------
@@ -1488,6 +1501,7 @@ class NetflixBot(commands.Bot):
             await reply_embed(emb)
         else:
             print(f"[Bot] Unhandled error: {type(error).__name__}: {error}")
+            import traceback
             traceback.print_exc()
             emb = discord.Embed(description="⚠️ An unexpected error occurred. Please try again later.", color=discord.Color.red())
             await reply_embed(emb)
