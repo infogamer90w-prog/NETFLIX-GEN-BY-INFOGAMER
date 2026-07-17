@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import threading
+import traceback
 import unicodedata
 import warnings
 import zipfile
@@ -501,7 +502,6 @@ def classify_tier(plan: str, quality: str) -> str:
 # FAST CHECKER (for restocking – minimal)
 # ==========================================
 def check_nf_cookie_fast(cookie_text: str) -> dict:
-    """Returns dict: ok, plan, quality, country, reason (if not ok)"""
     cookies = netscape_to_dict(cookie_text)
     if "NetflixId" not in cookies:
         return {"ok": False, "reason": "Missing NetflixId cookie."}
@@ -820,7 +820,6 @@ def _is_subscribed(info: dict) -> bool:
     return False
 
 def check_nf_cookie_full(cookie_text: str) -> dict:
-    """Full detailed checker, returns the same dict as original bot."""
     cookies = netscape_to_dict(cookie_text)
     if "NetflixId" not in cookies:
         return {"ok": False, "reason": "Missing NetflixId cookie."}
@@ -907,6 +906,16 @@ class GeneratorCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    # ---------- Helper to safely send error embeds ----------
+    async def _send_error(self, interaction: discord.Interaction, message: str):
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except Exception:
+            pass
+
     # ---------- GENERATION (uses FULL checker) ----------
     async def _generate(self, interaction: discord.Interaction,
                         tier: str, label: str, emoji: str) -> None:
@@ -917,152 +926,152 @@ class GeneratorCog(commands.Cog):
             return
 
         loop = asyncio.get_running_loop()
+        cookie = None  # track cookie for pushback on failure
 
-        for attempt in range(5):
-            try:
-                cookie = await loop.run_in_executor(None, db.pop_cookie, tier)
-            except Exception as e:
-                print(f"[Gen] DB pop error: {e}")
-                await interaction.followup.send("❌ Database error. Please try again later.", ephemeral=True)
-                return
+        try:
+            for attempt in range(5):
+                try:
+                    cookie = await loop.run_in_executor(None, db.pop_cookie, tier)
+                except Exception as e:
+                    print(f"[Gen] DB pop error: {e}")
+                    await self._send_error(interaction, "❌ Database error. Please try again later.")
+                    return
 
-            if not cookie:
-                await interaction.followup.send(
-                    f"❌ No **{label}** Netflix accounts in stock. Check back later!",
-                    ephemeral=True,
-                )
-                return
+                if not cookie:
+                    await self._send_error(interaction,
+                        f"❌ No **{label}** Netflix accounts in stock. Check back later!")
+                    return
 
-            try:
-                check = await loop.run_in_executor(None, check_nf_cookie_full, cookie)
-            except Exception as e:
-                print(f"[Gen] Check error: {e}")
-                await interaction.followup.send("❌ Error checking the account. Please try again.", ephemeral=True)
-                # Push cookie back because we couldn't evaluate it
-                await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
-                return
-
-            if not check["ok"]:
-                if "NFToken" in check.get("reason", ""):
-                    # Valid cookie but NFToken failed -> push back
+                try:
+                    check = await loop.run_in_executor(None, check_nf_cookie_full, cookie)
+                except Exception as e:
+                    print(f"[Gen] Check error: {e}\n{traceback.format_exc()}")
+                    await self._send_error(interaction, "❌ Error checking the account. Please try again.")
+                    # Push cookie back because we couldn't evaluate it
                     await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
-                    await interaction.followup.send(
-                        f"❌ Something went wrong while generating your account. "
-                        f"Please open a ticket in <#{TICKET_CHANNEL_ID}> and report the problem.",
-                        ephemeral=True,
-                    )
+                    return
+
+                if not check["ok"]:
+                    if "NFToken" in check.get("reason", ""):
+                        # Valid cookie but NFToken failed -> push back
+                        await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
+                        await self._send_error(interaction,
+                            f"❌ Something went wrong while generating your account. "
+                            f"Please open a ticket in <#{TICKET_CHANNEL_ID}> and report the problem.")
+                        continue
+                    # Dead cookie – discard
                     continue
-                # Dead cookie – discard
-                continue
 
-            nft = check.get("nft")
-            if not nft:
-                continue
+                nft = check.get("nft")
+                if not nft:
+                    continue
 
-            full_info = check.get("full_info", {})
-            if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
-                # On-hold – discard
-                continue
+                full_info = check.get("full_info", {})
+                if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
+                    continue  # On-hold – discard
 
-            links = build_links_for_tier(nft["token"], tier)
-            link_lines = [f"{lbl}: {url}" for lbl, url in links]
-            links_text = "\n".join(link_lines)
+                # Everything from here is wrapped to catch unexpected errors
+                try:
+                    links = build_links_for_tier(nft["token"], tier)
+                    link_lines = [f"{lbl}: {url}" for lbl, url in links]
+                    links_text = "\n".join(link_lines)
 
-            dm_embed = discord.Embed(
-                title=f"{emoji} {label} Netflix Account",
-                description=(
-                    "**📖 How to login:**\n"
-                    "Click the links below (they are **one‑time use**).\n"
-                    "If you need help, create a ticket in <#1516530741826289796>.\n\n"
-                    f"{links_text}"
-                ),
-                color=discord.Color.red(),
-            )
-            dm_embed.add_field(name="📌 Status",     value="Subscribed", inline=True)
-            if full_info.get("accountOwnerName"):
-                dm_embed.add_field(name="👤 Name", value=full_info["accountOwnerName"], inline=True)
-            if full_info.get("email"):
-                dm_embed.add_field(name="📧 Email", value=full_info["email"], inline=True)
-            if full_info.get("countryDisplay"):
-                dm_embed.add_field(name="🌍 Country", value=full_info["countryDisplay"], inline=True)
-            dm_embed.add_field(name="📦 Plan",       value=check.get("plan", "Unknown"), inline=True)
-            if full_info.get("memberSince"):
-                dm_embed.add_field(name="📅 Member Since", value=full_info["memberSince"], inline=True)
-            if full_info.get("nextBillingDate"):
-                dm_embed.add_field(name="🗓️ Next Billing", value=full_info["nextBillingDate"], inline=True)
-            if full_info.get("paymentMethodType"):
-                dm_embed.add_field(name="💳 Payment", value=full_info["paymentMethodType"], inline=True)
-            if full_info.get("maskedCard"):
-                dm_embed.add_field(name="💳 Card", value=full_info["maskedCard"], inline=True)
-            if full_info.get("phoneDisplay"):
-                dm_embed.add_field(name="📱 Phone", value=full_info["phoneDisplay"], inline=True)
-            dm_embed.add_field(name="🎞️ Quality",    value=(check.get("quality") or "").title(), inline=True)
-            if check.get("maxStreams"):
-                dm_embed.add_field(name="📺 Streams", value=check["maxStreams"], inline=True)
-            if full_info.get("planPrice"):
-                dm_embed.add_field(name="💰 Price", value=full_info["planPrice"], inline=True)
-            if full_info.get("holdStatus") is not None:
-                dm_embed.add_field(name="⏸️ Hold Status", value=full_info["holdStatus"], inline=True)
-            if full_info.get("showExtraMemberSection"):
-                dm_embed.add_field(name="👥 Extra Member", value=full_info["showExtraMemberSection"], inline=True)
-            if full_info.get("emailVerified"):
-                dm_embed.add_field(name="✅ Email Verified", value=full_info["emailVerified"], inline=True)
-            if check.get("status"):
-                dm_embed.add_field(name="🛡️ Membership Status", value=check["status"].replace("_", " ").title(), inline=True)
-            if full_info.get("profilesDisplay"):
-                profile_count = len(full_info["profilesDisplay"].split(", "))
-                dm_embed.add_field(name=f"🎭 Profiles ({profile_count})", value=full_info["profilesDisplay"], inline=False)
+                    dm_embed = discord.Embed(
+                        title=f"{emoji} {label} Netflix Account",
+                        description=(
+                            "**📖 How to login:**\n"
+                            "Click the links below (they are **one‑time use**).\n"
+                            "If you need help, create a ticket in <#1516530741826289796>.\n\n"
+                            f"{links_text}"
+                        ),
+                        color=discord.Color.red(),
+                    )
+                    dm_embed.add_field(name="📌 Status",     value="Subscribed", inline=True)
+                    if full_info.get("accountOwnerName"):
+                        dm_embed.add_field(name="👤 Name", value=full_info["accountOwnerName"], inline=True)
+                    if full_info.get("email"):
+                        dm_embed.add_field(name="📧 Email", value=full_info["email"], inline=True)
+                    if full_info.get("countryDisplay"):
+                        dm_embed.add_field(name="🌍 Country", value=full_info["countryDisplay"], inline=True)
+                    dm_embed.add_field(name="📦 Plan",       value=check.get("plan", "Unknown"), inline=True)
+                    if full_info.get("memberSince"):
+                        dm_embed.add_field(name="📅 Member Since", value=full_info["memberSince"], inline=True)
+                    if full_info.get("nextBillingDate"):
+                        dm_embed.add_field(name="🗓️ Next Billing", value=full_info["nextBillingDate"], inline=True)
+                    if full_info.get("paymentMethodType"):
+                        dm_embed.add_field(name="💳 Payment", value=full_info["paymentMethodType"], inline=True)
+                    if full_info.get("maskedCard"):
+                        dm_embed.add_field(name="💳 Card", value=full_info["maskedCard"], inline=True)
+                    if full_info.get("phoneDisplay"):
+                        dm_embed.add_field(name="📱 Phone", value=full_info["phoneDisplay"], inline=True)
+                    dm_embed.add_field(name="🎞️ Quality",    value=(check.get("quality") or "").title(), inline=True)
+                    if check.get("maxStreams"):
+                        dm_embed.add_field(name="📺 Streams", value=check["maxStreams"], inline=True)
+                    if full_info.get("planPrice"):
+                        dm_embed.add_field(name="💰 Price", value=full_info["planPrice"], inline=True)
+                    if full_info.get("holdStatus") is not None:
+                        dm_embed.add_field(name="⏸️ Hold Status", value=full_info["holdStatus"], inline=True)
+                    if full_info.get("showExtraMemberSection"):
+                        dm_embed.add_field(name="👥 Extra Member", value=full_info["showExtraMemberSection"], inline=True)
+                    if full_info.get("emailVerified"):
+                        dm_embed.add_field(name="✅ Email Verified", value=full_info["emailVerified"], inline=True)
+                    if check.get("status"):
+                        dm_embed.add_field(name="🛡️ Membership Status", value=check["status"].replace("_", " ").title(), inline=True)
+                    if full_info.get("profilesDisplay"):
+                        profile_count = len(full_info["profilesDisplay"].split(", "))
+                        dm_embed.add_field(name=f"🎭 Profiles ({profile_count})", value=full_info["profilesDisplay"], inline=False)
 
-            dm_embed.set_footer(text=f"{label} by INFOGAMER | Vouch in <#{VOUCH_CHANNEL_ID}>")
+                    dm_embed.set_footer(text=f"{label} by INFOGAMER | Vouch in <#{VOUCH_CHANNEL_ID}>")
 
-            try:
-                await interaction.user.send(embed=dm_embed)
-                dm_success = True
-            except discord.Forbidden:
-                dm_success = False
-            except Exception as e:
-                dm_success = False
-                print(f"[Gen] DM send error: {e}")
+                    try:
+                        await interaction.user.send(embed=dm_embed)
+                        dm_success = True
+                    except discord.Forbidden:
+                        dm_success = False
+                    except Exception as dm_err:
+                        dm_success = False
+                        print(f"[Gen] DM send error: {dm_err}")
 
-            if not dm_success:
-                # Push cookie back because DM failed
+                    if not dm_success:
+                        await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
+                        await self._send_error(interaction, "❌ I couldn't send you a DM. Please enable DMs and try again.")
+                        return
+
+                    ephemeral_embed = discord.Embed(
+                        title=f"{emoji} {label} Netflix Generated!",
+                        description="Account details have been sent to your DMs. Check your DM for login links.",
+                        color=discord.Color.green(),
+                    )
+                    ephemeral_embed.set_footer(text=f"Expires: {nft.get('expires_at_utc', 'Unknown')} | One‑time use")
+                    await interaction.followup.send(embed=ephemeral_embed, ephemeral=True)
+
+                    public_embed = discord.Embed(
+                        title="🎉 Netflix Account Generated!",
+                        description=(
+                            f"{interaction.user.mention} generated a **{label}** Netflix account.\n"
+                            f"Check your DMs for login links.\n\n"
+                            f"Please vouch in <#{VOUCH_CHANNEL_ID}> if you received a working account!"
+                        ),
+                        color=discord.Color.green(),
+                    )
+                    await interaction.followup.send(embed=public_embed, ephemeral=False)
+                    return  # success
+
+                except Exception as build_err:
+                    print(f"[Gen] Build/send error: {build_err}\n{traceback.format_exc()}")
+                    # Push cookie back because we couldn't deliver
+                    await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
+                    await self._send_error(interaction, "❌ An unexpected error occurred while preparing your account. Please try again.")
+                    return
+
+            # If loop ends without returning, all cookies were dead
+            await self._send_error(interaction, "❌ All available cookies were expired. Ask an admin to `/restock`!")
+
+        except Exception as outer_err:
+            print(f"[Gen] Unexpected outer error: {outer_err}\n{traceback.format_exc()}")
+            if cookie:  # try to return the last cookie if it was popped
                 await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
-                await interaction.followup.send(
-                    "❌ I couldn't send you a DM. Please enable DMs and try again.",
-                    ephemeral=True,
-                )
-                return
-
-            ephemeral_embed = discord.Embed(
-                title=f"{emoji} {label} Netflix Generated!",
-                description="Account details have been sent to your DMs. Check your DM for login links.",
-                color=discord.Color.green(),
-            )
-            ephemeral_embed.set_footer(text=f"Expires: {nft.get('expires_at_utc', 'Unknown')} | One‑time use")
-            try:
-                await interaction.followup.send(embed=ephemeral_embed, ephemeral=True)
-            except Exception as e:
-                print(f"[Gen] Followup error: {e}")
-
-            public_embed = discord.Embed(
-                title="🎉 Netflix Account Generated!",
-                description=(
-                    f"{interaction.user.mention} generated a **{label}** Netflix account.\n"
-                    f"Check your DMs for login links.\n\n"
-                    f"Please vouch in <#{VOUCH_CHANNEL_ID}> if you received a working account!"
-                ),
-                color=discord.Color.green(),
-            )
-            try:
-                await interaction.followup.send(embed=public_embed, ephemeral=False)
-            except Exception as e:
-                print(f"[Gen] Public message error: {e}")
-            return
-
-        await interaction.followup.send(
-            "❌ All available cookies were expired. Ask an admin to `/restock`!",
-            ephemeral=True,
-        )
+            await self._send_error(interaction, "❌ An unexpected error occurred. Please try again later.")
 
     @app_commands.command(name="fgen", description="🆓 Generate a Free Netflix account")
     @in_channel(FGEN_CHANNEL_ID)
@@ -1198,7 +1207,13 @@ class GeneratorCog(commands.Cog):
                     await progress_msg.edit(embed=new_embed)
             return res
 
-        results = await asyncio.gather(*[_check(cookie, fname) for cookie, fname in unique_cookies])
+        try:
+            results = await asyncio.gather(*[_check(cookie, fname) for cookie, fname in unique_cookies])
+        except Exception as e:
+            print(f"[Restock] Gather error: {e}\n{traceback.format_exc()}")
+            await self._send_error(interaction, "❌ An error occurred during checking. Please try again.")
+            executor.shutdown(wait=False)
+            return
         executor.shutdown(wait=False)
 
         sorted_cookies = {"free": [], "booster": [], "premium": []}
@@ -1269,13 +1284,17 @@ class GeneratorCog(commands.Cog):
     @in_channel(ADMIN_CHANNEL_ID)
     async def stock(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        counts = await asyncio.get_running_loop().run_in_executor(None, db.stock)
-        embed = discord.Embed(title="📦 Netflix Account Vault", color=discord.Color.dark_theme())
-        for label, key in [("💎 Premium", "premium"), ("🚀 Booster", "booster"), ("🆓 Free", "free")]:
-            c = counts[key]
-            embed.add_field(name=label, value=f"{'🟢' if c > 0 else '🔴'} **{c}** account(s)", inline=False)
-        embed.set_footer(text=f"Total: {sum(counts.values())} accounts")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        try:
+            counts = await asyncio.get_running_loop().run_in_executor(None, db.stock)
+            embed = discord.Embed(title="📦 Netflix Account Vault", color=discord.Color.dark_theme())
+            for label, key in [("💎 Premium", "premium"), ("🚀 Booster", "booster"), ("🆓 Free", "free")]:
+                c = counts[key]
+                embed.add_field(name=label, value=f"{'🟢' if c > 0 else '🔴'} **{c}** account(s)", inline=False)
+            embed.set_footer(text=f"Total: {sum(counts.values())} accounts")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as e:
+            print(f"[Stock] Error: {e}\n{traceback.format_exc()}")
+            await self._send_error(interaction, "❌ Could not retrieve stock levels. Please try again.")
 
     # ---------- /removecookies ----------
     @app_commands.command(name="removecookies", description="[ADMIN] Remove accounts by uploading a file with cookies to delete")
@@ -1469,9 +1488,8 @@ class NetflixBot(commands.Bot):
             await reply_embed(emb)
         else:
             print(f"[Bot] Unhandled error: {type(error).__name__}: {error}")
-            import traceback
             traceback.print_exc()
-            emb = discord.Embed(description=f"⚠️ An unexpected error occurred. Please try again later.", color=discord.Color.red())
+            emb = discord.Embed(description="⚠️ An unexpected error occurred. Please try again later.", color=discord.Color.red())
             await reply_embed(emb)
 
 # ==========================================
