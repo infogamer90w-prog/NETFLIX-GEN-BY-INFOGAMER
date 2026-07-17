@@ -469,9 +469,7 @@ def create_nftoken_fast(cookie_text: str) -> tuple[dict | None, str | None]:
     except Exception as e:
         return None, str(e)
 
-# ------------------------------------------------
-# normalize_plan_key (MUST be defined before use)
-# ------------------------------------------------
+# ---------- Essential utility: plan key normalization (defined early) ----------
 def normalize_plan_key(value: str | None) -> str:
     if not value:
         return "unknown"
@@ -912,11 +910,22 @@ class GeneratorCog(commands.Cog):
     # ---------- GENERATION (uses FULL checker) ----------
     async def _generate(self, interaction: discord.Interaction,
                         tier: str, label: str, emoji: str) -> None:
-        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception as e:
+            print(f"[Gen] Defer error: {e}")
+            return
+
         loop = asyncio.get_running_loop()
 
         for attempt in range(5):
-            cookie = await loop.run_in_executor(None, db.pop_cookie, tier)
+            try:
+                cookie = await loop.run_in_executor(None, db.pop_cookie, tier)
+            except Exception as e:
+                print(f"[Gen] DB pop error: {e}")
+                await interaction.followup.send("❌ Database error. Please try again later.", ephemeral=True)
+                return
+
             if not cookie:
                 await interaction.followup.send(
                     f"❌ No **{label}** Netflix accounts in stock. Check back later!",
@@ -924,7 +933,15 @@ class GeneratorCog(commands.Cog):
                 )
                 return
 
-            check = await loop.run_in_executor(None, check_nf_cookie_full, cookie)
+            try:
+                check = await loop.run_in_executor(None, check_nf_cookie_full, cookie)
+            except Exception as e:
+                print(f"[Gen] Check error: {e}")
+                await interaction.followup.send("❌ Error checking the account. Please try again.", ephemeral=True)
+                # Push cookie back because we couldn't evaluate it
+                await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
+                return
+
             if not check["ok"]:
                 if "NFToken" in check.get("reason", ""):
                     # Valid cookie but NFToken failed -> push back
@@ -1003,6 +1020,9 @@ class GeneratorCog(commands.Cog):
                 dm_success = True
             except discord.Forbidden:
                 dm_success = False
+            except Exception as e:
+                dm_success = False
+                print(f"[Gen] DM send error: {e}")
 
             if not dm_success:
                 # Push cookie back because DM failed
@@ -1019,7 +1039,10 @@ class GeneratorCog(commands.Cog):
                 color=discord.Color.green(),
             )
             ephemeral_embed.set_footer(text=f"Expires: {nft.get('expires_at_utc', 'Unknown')} | One‑time use")
-            await interaction.followup.send(embed=ephemeral_embed, ephemeral=True)
+            try:
+                await interaction.followup.send(embed=ephemeral_embed, ephemeral=True)
+            except Exception as e:
+                print(f"[Gen] Followup error: {e}")
 
             public_embed = discord.Embed(
                 title="🎉 Netflix Account Generated!",
@@ -1030,7 +1053,10 @@ class GeneratorCog(commands.Cog):
                 ),
                 color=discord.Color.green(),
             )
-            await interaction.followup.send(embed=public_embed, ephemeral=False)
+            try:
+                await interaction.followup.send(embed=public_embed, ephemeral=False)
+            except Exception as e:
+                print(f"[Gen] Public message error: {e}")
             return
 
         await interaction.followup.send(
@@ -1442,8 +1468,10 @@ class NetflixBot(commands.Bot):
             emb = discord.Embed(description="❌ You need **Administrator** permission.", color=discord.Color.red())
             await reply_embed(emb)
         else:
-            print(f"[Bot] Error: {type(error).__name__}: {error}")
-            emb = discord.Embed(description=f"⚠️ Unexpected error: `{type(error).__name__}`", color=discord.Color.red())
+            print(f"[Bot] Unhandled error: {type(error).__name__}: {error}")
+            import traceback
+            traceback.print_exc()
+            emb = discord.Embed(description=f"⚠️ An unexpected error occurred. Please try again later.", color=discord.Color.red())
             await reply_embed(emb)
 
 # ==========================================
