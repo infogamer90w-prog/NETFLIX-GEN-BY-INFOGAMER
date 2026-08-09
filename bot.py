@@ -784,16 +784,29 @@ def in_channel(channel_id: int):
 RESTOCK_IMAGE_URL = "https://drive.google.com/file/d/1XfkCzgKixfwH7QJ332YnG--NTI8aTv5D/view?usp=drive_link"   # <-- replace with actual direct image link
 
 class GeneratorCog(commands.Cog):
+    LOG_WEBHOOK_URL = os.environ.get("LOG_WEBHOOK_URL", "")
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    async def _webhook_log(self, content: str = None, embed: discord.Embed = None):
+        """Send a log message to the configured webhook (non-critical)."""
+        if not self.LOG_WEBHOOK_URL:
+            return
+        try:
+            async with aiohttp.ClientSession() as session:
+                webhook = discord.Webhook.from_url(self.LOG_WEBHOOK_URL, session=session)
+                await webhook.send(content=content, embed=embed, username="Restock Logger")
+        except Exception as e:
+            print(f"[Webhook] Failed to send log: {e}")
 
     async def _generate(
         self, interaction: discord.Interaction,
         tier: str, label: str, emoji: str,
     ) -> None:
+        # ---- _generate stays exactly as before (no changes) ----
         await interaction.response.defer(ephemeral=True)
         loop = asyncio.get_running_loop()
-
         for attempt in range(5):
             cookie = await loop.run_in_executor(None, db.pop_cookie, tier)
             if not cookie:
@@ -802,31 +815,24 @@ class GeneratorCog(commands.Cog):
                     ephemeral=True,
                 )
                 return
-
             check = await loop.run_in_executor(None, check_nf_cookie, cookie)
             if not check["ok"]:
                 if "NFToken" in check.get("reason", ""):
-                    # NFToken generation failed, but maybe another cookie works
                     await interaction.followup.send(
                         f"❌ Something went wrong while generating your account. "
                         f"Please open a ticket in <#{TICKET_CHANNEL_ID}> and report the problem.",
                         ephemeral=True,
                     )
-                    # Do not push back – NFToken failure likely means account is dead
                     continue
                 print(f"[Gen] Dead {tier} cookie (attempt {attempt+1}): {check.get('reason')}")
                 continue
-
             nft = check.get("nft")
             if not nft:
                 continue
-
             full_info = check.get("full_info", {})
-
             if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
                 print(f"[Gen] Skipping on-hold {tier} cookie (attempt {attempt+1})")
                 continue
-
             links = build_links_for_tier(nft["token"], tier)
             link_lines = []
             for lbl, url in links:
@@ -887,7 +893,6 @@ class GeneratorCog(commands.Cog):
                 dm_success = False
 
             if not dm_success:
-                # DM failed – put cookie back so it's not wasted
                 await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
                 await interaction.followup.send(
                     "❌ I couldn't send you a DM. Please enable DMs and try again.",
@@ -895,7 +900,6 @@ class GeneratorCog(commands.Cog):
                 )
                 return
 
-            # Ephemeral confirmation for the user
             ephemeral_embed = discord.Embed(
                 title=f"{emoji} {label} Netflix Generated!",
                 description="Account details have been sent to your DMs. Check your DM for login links.",
@@ -904,7 +908,6 @@ class GeneratorCog(commands.Cog):
             ephemeral_embed.set_footer(text=f"Expires: {nft.get('expires_at_utc', 'Unknown')} | One‑time use")
             await interaction.followup.send(embed=ephemeral_embed, ephemeral=True)
 
-            # Public announcement in the channel (not ephemeral)
             public_embed = discord.Embed(
                 title="🎉 Netflix Account Generated!",
                 description=(
@@ -914,7 +917,7 @@ class GeneratorCog(commands.Cog):
                 ),
                 color=discord.Color.green(),
             )
-            await interaction.channel.send(embed=public_embed)   # <-- public, visible to all
+            await interaction.channel.send(embed=public_embed)
             return
 
         await interaction.followup.send(
@@ -922,6 +925,7 @@ class GeneratorCog(commands.Cog):
             ephemeral=True,
         )
 
+    # ---------- generation commands ----------
     @app_commands.command(name="fgen", description="🆓 Generate a Free Netflix account")
     @in_channel(FGEN_CHANNEL_ID)
     @app_commands.checks.cooldown(1, 86400, key=lambda i: i.user.id if i.user.id != OWNER_ID else object())
@@ -940,259 +944,233 @@ class GeneratorCog(commands.Cog):
     async def pgen(self, interaction: discord.Interaction):
         await self._generate(interaction, "premium", "Premium", "💎")
 
+    # ---------- ADMIN: RESTOCK (with webhook progress) ----------
     @app_commands.command(
         name="restock",
         description="[ADMIN] Upload up to 5 files (.txt/.json/.zip) — auto-extracted, checked & sorted",
     )
-    LOG_WEBHOOK_URL = os.environ.get("LOG_WEBHOOK_URL", "")
+    @app_commands.checks.has_permissions(administrator=True)
+    @in_channel(ADMIN_CHANNEL_ID)
+    async def restock(
+        self,
+        interaction: discord.Interaction,
+        file1: discord.Attachment,
+        file2: discord.Attachment | None = None,
+        file3: discord.Attachment | None = None,
+        file4: discord.Attachment | None = None,
+        file5: discord.Attachment | None = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
 
-async def _webhook_log(self, content: str = None, embed: discord.Embed = None):
-    """Send a log message to the configured webhook (non-critical)."""
-    if not self.LOG_WEBHOOK_URL:
-        return
-    try:
-        async with aiohttp.ClientSession() as session:
-            webhook = discord.Webhook.from_url(self.LOG_WEBHOOK_URL, session=session)
-            await webhook.send(content=content, embed=embed, username="Restock Logger")
-    except Exception as e:
-        print(f"[Webhook] Failed to send log: {e}")
-
-@app_commands.command(
-    name="restock",
-    description="[ADMIN] Upload up to 5 files (.txt/.json/.zip) — auto-extracted, checked & sorted",
-)
-@app_commands.checks.has_permissions(administrator=True)
-@in_channel(ADMIN_CHANNEL_ID)
-async def restock(
-    self,
-    interaction: discord.Interaction,
-    file1: discord.Attachment,
-    file2: discord.Attachment | None = None,
-    file3: discord.Attachment | None = None,
-    file4: discord.Attachment | None = None,
-    file5: discord.Attachment | None = None,
-):
-    await interaction.response.defer(ephemeral=True)
-
-    attachments = [f for f in (file1, file2, file3, file4, file5) if f is not None]
-    ALLOWED = (".txt", ".json", ".zip")
-    bad = [f.filename for f in attachments if not f.filename.lower().endswith(ALLOWED)]
-    if bad:
-        return await interaction.followup.send(
-            f"❌ Only `.txt` / `.json` / `.zip` files accepted. Rejected: {', '.join(bad)}",
-            ephemeral=True,
-        )
-
-    all_accounts: list[str] = []
-    file_names:   list[str] = []
-
-    for att in attachments:
-        try:
-            raw_bytes = await att.read()
-        except Exception as e:
+        attachments = [f for f in (file1, file2, file3, file4, file5) if f is not None]
+        ALLOWED = (".txt", ".json", ".zip")
+        bad = [f.filename for f in attachments if not f.filename.lower().endswith(ALLOWED)]
+        if bad:
             return await interaction.followup.send(
-                f"❌ Could not read `{att.filename}`: {e}", ephemeral=True
+                f"❌ Only `.txt` / `.json` / `.zip` files accepted. Rejected: {', '.join(bad)}",
+                ephemeral=True,
             )
 
-        if att.filename.lower().endswith(".zip"):
-            found, inner_summary = extract_cookies_from_zip(raw_bytes)
-            all_accounts.extend(found)
-            inner_lines = "\n  ".join(inner_summary) if inner_summary else "(empty)"
-            file_names.append(
-                f"`{att.filename}` → {len(found)} cookies\n  {inner_lines}"
-            )
-        else:
-            raw = raw_bytes.decode("utf-8", errors="ignore")
-            found = parse_cookie_file(raw)
-            all_accounts.extend(found)
-            file_names.append(f"`{att.filename}` ({len(found)} cookies)")
+        all_accounts: list[str] = []
+        file_names:   list[str] = []
 
-    if not all_accounts:
-        return await interaction.followup.send(
-            "❌ No valid Netflix cookies found in any uploaded file.",
+        for att in attachments:
+            try:
+                raw_bytes = await att.read()
+            except Exception as e:
+                return await interaction.followup.send(
+                    f"❌ Could not read `{att.filename}`: {e}", ephemeral=True
+                )
+
+            if att.filename.lower().endswith(".zip"):
+                found, inner_summary = extract_cookies_from_zip(raw_bytes)
+                all_accounts.extend(found)
+                inner_lines = "\n  ".join(inner_summary) if inner_summary else "(empty)"
+                file_names.append(
+                    f"`{att.filename}` → {len(found)} cookies\n  {inner_lines}"
+                )
+            else:
+                raw = raw_bytes.decode("utf-8", errors="ignore")
+                found = parse_cookie_file(raw)
+                all_accounts.extend(found)
+                file_names.append(f"`{att.filename}` ({len(found)} cookies)")
+
+        if not all_accounts:
+            return await interaction.followup.send(
+                "❌ No valid Netflix cookies found in any uploaded file.",
+                ephemeral=True,
+            )
+
+        await interaction.followup.send(
+            f"⏳ Scanning **{len(all_accounts)}** cookie(s) from **{len(attachments)}** file(s)… Please wait.",
             ephemeral=True,
         )
 
-    # Progress message
-    await interaction.followup.send(
-        f"⏳ Scanning **{len(all_accounts)}** cookie(s) from **{len(attachments)}** file(s)… Please wait.",
-        ephemeral=True,
-    )
+        loop = asyncio.get_running_loop()
 
-    loop = asyncio.get_running_loop()
-
-    # Deduplicate against existing IDs
-    existing_ids: set[str] = await loop.run_in_executor(None, db.existing_netflix_ids)
-    seen_ids = set(existing_ids)
-    unique = []
-    dupes = 0
-    for cookie in all_accounts:
-        nid = netscape_to_dict(cookie).get("NetflixId", "").strip()
-        if nid and nid in seen_ids:
-            dupes += 1
-        else:
-            unique.append(cookie)
-            if nid:
-                seen_ids.add(nid)
-
-    # -------------------------------
-    # HIGH-PERFORMANCE PARALLEL CHECK
-    # -------------------------------
-    MAX_WORKERS = 150
-    SEM_LIMIT   = 150
-    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-    sem = asyncio.Semaphore(SEM_LIMIT)
-
-    # Shared counters for progress logging
-    total_unique = len(unique)
-    checked_count = 0
-    dead_local = 0
-    active_local = 0
-    on_hold_local = 0
-    lock = asyncio.Lock()
-
-    async def _check_with_progress(cookie: str) -> dict:
-        nonlocal checked_count, dead_local, active_local, on_hold_local
-        async with sem:
-            result = await loop.run_in_executor(executor, check_nf_cookie, cookie)
-        async with lock:
-            checked_count += 1
-            if result["ok"]:
-                full_info = result.get("full_info", {})
-                if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
-                    on_hold_local += 1
-                else:
-                    active_local += 1
+        # Deduplicate against existing IDs
+        existing_ids: set[str] = await loop.run_in_executor(None, db.existing_netflix_ids)
+        seen_ids = set(existing_ids)
+        unique = []
+        dupes = 0
+        for cookie in all_accounts:
+            nid = netscape_to_dict(cookie).get("NetflixId", "").strip()
+            if nid and nid in seen_ids:
+                dupes += 1
             else:
-                dead_local += 1
-        return result
+                unique.append(cookie)
+                if nid:
+                    seen_ids.add(nid)
 
-    async def _progress_logger():
-        """Send progress to webhook every 3 seconds."""
-        while True:
-            await asyncio.sleep(3)
+        # -------------------------------
+        # HIGH-PERFORMANCE PARALLEL CHECK
+        # -------------------------------
+        MAX_WORKERS = 150
+        SEM_LIMIT   = 150
+        executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        sem = asyncio.Semaphore(SEM_LIMIT)
+
+        total_unique = len(unique)
+        checked_count = 0
+        dead_local = 0
+        active_local = 0
+        on_hold_local = 0
+        lock = asyncio.Lock()
+
+        async def _check_with_progress(cookie: str) -> dict:
+            nonlocal checked_count, dead_local, active_local, on_hold_local
+            async with sem:
+                result = await loop.run_in_executor(executor, check_nf_cookie, cookie)
             async with lock:
-                done = checked_count
-                remaining = total_unique - done
-                if remaining == 0:
-                    break
-                embed = discord.Embed(
-                    title="🔄 Restock Progress",
-                    description=(
-                        f"**{done}/{total_unique}** cookies checked\n"
-                        f"🟢 Active: {active_local}  💀 Dead: {dead_local}  ⏸️ Hold: {on_hold_local}"
-                    ),
-                    color=discord.Color.blurple()
-                )
-                await self._webhook_log(embed=embed)
+                checked_count += 1
+                if result["ok"]:
+                    full_info = result.get("full_info", {})
+                    if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
+                        on_hold_local += 1
+                    else:
+                        active_local += 1
+                else:
+                    dead_local += 1
+            return result
 
-    # Log start
-    await self._webhook_log(
-        f"📥 **Restock started** by {interaction.user.mention} — {len(unique)} unique cookies to check."
-    )
+        async def _progress_logger():
+            while True:
+                await asyncio.sleep(3)
+                async with lock:
+                    done = checked_count
+                    remaining = total_unique - done
+                    if remaining == 0:
+                        break
+                    embed = discord.Embed(
+                        title="🔄 Restock Progress",
+                        description=(
+                            f"**{done}/{total_unique}** cookies checked\n"
+                            f"🟢 Active: {active_local}  💀 Dead: {dead_local}  ⏸️ Hold: {on_hold_local}"
+                        ),
+                        color=discord.Color.blurple()
+                    )
+                    await self._webhook_log(embed=embed)
 
-    # Start checking and progress logging concurrently
-    progress_task = asyncio.create_task(_progress_logger())
-    try:
-        results = await asyncio.gather(*[_check_with_progress(c) for c in unique])
-    finally:
-        executor.shutdown(wait=False)
-
-    progress_task.cancel()
-    try:
-        await progress_task
-    except asyncio.CancelledError:
-        pass
-
-    # Sort results (use original classification, ignore logger's local counts)
-    sorted_cookies = {"free": [], "booster": [], "premium": []}
-    dead = 0
-    on_hold = 0
-
-    for cookie, res in zip(unique, results):
-        if res["ok"]:
-            full_info = res.get("full_info", {})
-            if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
-                on_hold += 1
-                continue
-            tier = classify_tier(res.get("plan", ""), res.get("quality", ""))
-            sorted_cookies[tier].append(cookie)
-        else:
-            dead += 1
-
-    # Save to DB
-    data = await loop.run_in_executor(None, db.get_all)
-    for t in ("free", "booster", "premium"):
-        data["nf"][t].extend(sorted_cookies[t])
-    save_ok = await loop.run_in_executor(None, db.save, data)
-
-    # Get final stock counts
-    final_stock = await loop.run_in_executor(None, db.stock)
-
-    # Admin ephemeral embed (unchanged)
-    files_value = "\n".join(file_names)
-    if len(files_value) > 900:
-        files_value = files_value[:900] + "\n…"
-
-    admin_embed = discord.Embed(
-        title="✅ Restock Complete — Auto-sorted",
-        color=discord.Color.green() if save_ok else discord.Color.orange(),
-    )
-    admin_embed.add_field(name="📂 Files",           value=files_value,                    inline=False)
-    admin_embed.add_field(name="💎 Premium Added",   value=f"`{len(sorted_cookies['premium'])}`", inline=True)
-    admin_embed.add_field(name="🚀 Booster Added",   value=f"`{len(sorted_cookies['booster'])}`", inline=True)
-    admin_embed.add_field(name="🆓 Free Added",      value=f"`{len(sorted_cookies['free'])}`",    inline=True)
-    admin_embed.add_field(name="💀 Dead Filtered",   value=f"`{dead}`",                    inline=True)
-    admin_embed.add_field(name="♻️ Duplicates Skipped", value=f"`{dupes}`",               inline=True)
-    admin_embed.add_field(name="⏸️ On Hold Skipped", value=f"`{on_hold}`",                 inline=True)
-    admin_embed.add_field(name="📊 Total Scanned",   value=f"`{len(all_accounts)}`",       inline=True)
-    admin_embed.add_field(name="👤 Restocked by",    value=interaction.user.mention,       inline=False)
-    if not save_ok:
-        admin_embed.add_field(name="⚠️ Warning", value="Supabase write may have failed.", inline=False)
-
-    await interaction.followup.send(embed=admin_embed)
-
-    # Public restock channel embed
-    restock_channel = self.bot.get_channel(RESTOCK_CHANNEL_ID)
-    if restock_channel:
-        pub_embed = discord.Embed(
-            title="✅ Netflix Restock Successfully",
-            description=(
-                f"*🆓 Free Stock added = {len(sorted_cookies['free'])}*\n"
-                f"*🌟 Boosters Stock added = {len(sorted_cookies['booster'])}*\n"
-                f"*👑 Premium Stock added = {len(sorted_cookies['premium'])}*\n\n"
-                f"**Total Stock**\n"
-                f"*🆓 Free Stock = {final_stock['free']}*\n"
-                f"*🌟 Boosters Stock = {final_stock['booster']}*\n"
-                f"*👑 Premium Stock = {final_stock['premium']}*"
-            ),
-            color=0xd2af26,
+        # Log start
+        await self._webhook_log(
+            f"📥 **Restock started** by {interaction.user.mention} — {len(unique)} unique cookies to check."
         )
-        pub_embed.set_footer(text="⚠️ All Accounts Working With No Errors")
-        pub_embed.set_image(url=RESTOCK_IMAGE_URL)   # still needs a direct image URL
+
+        progress_task = asyncio.create_task(_progress_logger())
         try:
-            await restock_channel.send(embed=pub_embed)
-        except Exception as e:
-            await interaction.followup.send(
-                f"⚠️ Failed to notify restock channel: {e}",
-                ephemeral=True
+            results = await asyncio.gather(*[_check_with_progress(c) for c in unique])
+        finally:
+            executor.shutdown(wait=False)
+
+        progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
+
+        sorted_cookies = {"free": [], "booster": [], "premium": []}
+        dead = 0
+        on_hold = 0
+
+        for cookie, res in zip(unique, results):
+            if res["ok"]:
+                full_info = res.get("full_info", {})
+                if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
+                    on_hold += 1
+                    continue
+                tier = classify_tier(res.get("plan", ""), res.get("quality", ""))
+                sorted_cookies[tier].append(cookie)
+            else:
+                dead += 1
+
+        data = await loop.run_in_executor(None, db.get_all)
+        for t in ("free", "booster", "premium"):
+            data["nf"][t].extend(sorted_cookies[t])
+        save_ok = await loop.run_in_executor(None, db.save, data)
+
+        final_stock = await loop.run_in_executor(None, db.stock)
+
+        files_value = "\n".join(file_names)
+        if len(files_value) > 900:
+            files_value = files_value[:900] + "\n…"
+
+        admin_embed = discord.Embed(
+            title="✅ Restock Complete — Auto-sorted",
+            color=discord.Color.green() if save_ok else discord.Color.orange(),
+        )
+        admin_embed.add_field(name="📂 Files",           value=files_value,                    inline=False)
+        admin_embed.add_field(name="💎 Premium Added",   value=f"`{len(sorted_cookies['premium'])}`", inline=True)
+        admin_embed.add_field(name="🚀 Booster Added",   value=f"`{len(sorted_cookies['booster'])}`", inline=True)
+        admin_embed.add_field(name="🆓 Free Added",      value=f"`{len(sorted_cookies['free'])}`",    inline=True)
+        admin_embed.add_field(name="💀 Dead Filtered",   value=f"`{dead}`",                    inline=True)
+        admin_embed.add_field(name="♻️ Duplicates Skipped", value=f"`{dupes}`",               inline=True)
+        admin_embed.add_field(name="⏸️ On Hold Skipped", value=f"`{on_hold}`",                 inline=True)
+        admin_embed.add_field(name="📊 Total Scanned",   value=f"`{len(all_accounts)}`",       inline=True)
+        admin_embed.add_field(name="👤 Restocked by",    value=interaction.user.mention,       inline=False)
+        if not save_ok:
+            admin_embed.add_field(name="⚠️ Warning", value="Supabase write may have failed.", inline=False)
+
+        await interaction.followup.send(embed=admin_embed)
+
+        restock_channel = self.bot.get_channel(RESTOCK_CHANNEL_ID)
+        if restock_channel:
+            pub_embed = discord.Embed(
+                title="✅ Netflix Restock Successfully",
+                description=(
+                    f"*🆓 Free Stock added = {len(sorted_cookies['free'])}*\n"
+                    f"*🌟 Boosters Stock added = {len(sorted_cookies['booster'])}*\n"
+                    f"*👑 Premium Stock added = {len(sorted_cookies['premium'])}*\n\n"
+                    f"**Total Stock**\n"
+                    f"*🆓 Free Stock = {final_stock['free']}*\n"
+                    f"*🌟 Boosters Stock = {final_stock['booster']}*\n"
+                    f"*👑 Premium Stock = {final_stock['premium']}*"
+                ),
+                color=0xd2af26,
             )
+            pub_embed.set_footer(text="⚠️ All Accounts Working With No Errors")
+            pub_embed.set_image(url=RESTOCK_IMAGE_URL)
+            try:
+                await restock_channel.send(embed=pub_embed)
+            except Exception as e:
+                await interaction.followup.send(
+                    f"⚠️ Failed to notify restock channel: {e}",
+                    ephemeral=True
+                )
 
-    # Final webhook log
-    await self._webhook_log(
-        f"✅ **Restock finished** by {interaction.user.mention}\n"
-        f"Premium: +{len(sorted_cookies['premium'])}  "
-        f"Booster: +{len(sorted_cookies['booster'])}  "
-        f"Free: +{len(sorted_cookies['free'])}  "
-        f"Dead: {dead}  Duplicates: {dupes}  On-hold: {on_hold}"
-    )
+        await self._webhook_log(
+            f"✅ **Restock finished** by {interaction.user.mention}\n"
+            f"Premium: +{len(sorted_cookies['premium'])}  "
+            f"Booster: +{len(sorted_cookies['booster'])}  "
+            f"Free: +{len(sorted_cookies['free'])}  "
+            f"Dead: {dead}  Duplicates: {dupes}  On-hold: {on_hold}"
+        )
 
+    # ---------- other admin commands ----------
     @app_commands.command(name="stock", description="📦 Check Netflix account stock levels")
     @in_channel(ADMIN_CHANNEL_ID)
     async def stock(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         counts = await asyncio.get_running_loop().run_in_executor(None, db.stock)
-
         embed = discord.Embed(title="📦 Netflix Account Vault", color=discord.Color.dark_theme())
         for label, key in [("💎 Premium", "premium"), ("🚀 Booster", "booster"), ("🆓 Free", "free")]:
             c = counts[key]
@@ -1204,9 +1182,6 @@ async def restock(
         embed.set_footer(text=f"Total: {sum(counts.values())} accounts")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    # =====================
-    # /removecookies
-    # =====================
     @app_commands.command(
         name="removecookies",
         description="[ADMIN] Remove cookies from the vault by uploading a file with the cookies to delete"
@@ -1219,13 +1194,11 @@ async def restock(
         file: discord.Attachment
     ):
         await interaction.response.defer(ephemeral=True)
-
         if not file.filename.lower().endswith((".txt", ".json")):
             return await interaction.followup.send(
                 "❌ Only `.txt` / `.json` files are accepted.",
                 ephemeral=True
             )
-
         try:
             raw_bytes = await file.read()
             raw = raw_bytes.decode("utf-8", errors="ignore")
@@ -1234,26 +1207,22 @@ async def restock(
                 f"❌ Could not read `{file.filename}`: {e}",
                 ephemeral=True
             )
-
         accounts = parse_cookie_file(raw)
         if not accounts:
             return await interaction.followup.send(
                 "❌ No valid Netflix cookies found in the file.",
                 ephemeral=True
             )
-
         ids_to_remove = set()
         for cookie_text in accounts:
             nid = netscape_to_dict(cookie_text).get("NetflixId", "").strip()
             if nid:
                 ids_to_remove.add(nid)
-
         if not ids_to_remove:
             return await interaction.followup.send(
                 "❌ No NetflixId could be extracted from the uploaded cookies.",
                 ephemeral=True
             )
-
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(None, db.get_all)
         removed_count = 0
@@ -1267,16 +1236,13 @@ async def restock(
                 else:
                     new_list.append(cookie_text)
             data["nf"][tier] = new_list
-
         if removed_count == 0:
             return await interaction.followup.send(
                 "ℹ️ No matching cookies found in the vault.",
                 ephemeral=True
             )
-
         success = await loop.run_in_executor(None, db.save, data)
         status = "✅" if success else "⚠️ (save may have failed)"
-
         embed = discord.Embed(
             title="🗑️ Cookies Removed",
             description=f"{status} Removed **{removed_count}** account(s) from the vault.",
@@ -1284,12 +1250,8 @@ async def restock(
         )
         embed.add_field(name="📂 File", value=file.filename, inline=False)
         embed.add_field(name="🔑 NetflixIds to remove", value=f"`{len(ids_to_remove)}` unique", inline=True)
-
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    # =====================
-    # /exportandclear
-    # =====================
     @app_commands.command(
         name="exportandclear",
         description="[ADMIN] Export all vault cookies (tier-wise zip) and then empty the entire vault"
@@ -1298,10 +1260,8 @@ async def restock(
     @in_channel(ADMIN_CHANNEL_ID)
     async def exportandclear(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(None, db.get_all)
-
         tiers = {
             "free": data["nf"].get("free", []),
             "booster": data["nf"].get("booster", []),
@@ -1310,22 +1270,19 @@ async def restock(
         total = sum(len(v) for v in tiers.values())
         if total == 0:
             return await interaction.followup.send("❌ The vault is already empty.", ephemeral=True)
-
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for tier_name, cookies in tiers.items():
                 if cookies:
                     content = "\n\n".join(cookies)
                     zf.writestr(f"{tier_name}.txt", content)
-
         zip_buffer.seek(0)
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")   # fixed deprecated utcnow
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         file = discord.File(
             fp=zip_buffer,
             filename=f"vault_export_{timestamp}.zip",
             description="Full vault export (tier-wise)"
         )
-
         try:
             await interaction.user.send(
                 f"📦 **Vault Export**\n"
@@ -1337,17 +1294,14 @@ async def restock(
             dm_ok = True
         except discord.Forbidden:
             dm_ok = False
-
         if not dm_ok:
             return await interaction.followup.send(
                 "❌ I couldn't DM you. Please enable DMs and try again.",
                 ephemeral=True
             )
-
         for t in ("free", "booster", "premium"):
             data["nf"][t] = []
         success = await loop.run_in_executor(None, db.save, data)
-
         embed = discord.Embed(
             title="🗑️ Vault Cleared",
             description=f"✅ **{total}** account(s) removed. Zip sent to your DMs.",
