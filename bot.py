@@ -806,6 +806,7 @@ class GeneratorCog(commands.Cog):
     ) -> None:
         await interaction.response.defer(ephemeral=True)
         loop = asyncio.get_running_loop()
+
         for attempt in range(5):
             cookie = await loop.run_in_executor(None, db.pop_cookie, tier)
             if not cookie:
@@ -814,6 +815,7 @@ class GeneratorCog(commands.Cog):
                     ephemeral=True,
                 )
                 return
+
             check = await loop.run_in_executor(None, check_nf_cookie, cookie)
             if not check["ok"]:
                 if "NFToken" in check.get("reason", ""):
@@ -825,13 +827,17 @@ class GeneratorCog(commands.Cog):
                     continue
                 print(f"[Gen] Dead {tier} cookie (attempt {attempt+1}): {check.get('reason')}")
                 continue
+
             nft = check.get("nft")
             if not nft:
                 continue
+
             full_info = check.get("full_info", {})
+
             if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
                 print(f"[Gen] Skipping on-hold {tier} cookie (attempt {attempt+1})")
                 continue
+
             links = build_links_for_tier(nft["token"], tier)
             link_lines = []
             for lbl, url in links:
@@ -892,6 +898,7 @@ class GeneratorCog(commands.Cog):
                 dm_success = False
 
             if not dm_success:
+                # DM failed – put cookie back so it's not wasted
                 await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
                 await interaction.followup.send(
                     "❌ I couldn't send you a DM. Please enable DMs and try again.",
@@ -899,6 +906,7 @@ class GeneratorCog(commands.Cog):
                 )
                 return
 
+            # Ephemeral confirmation for the user
             ephemeral_embed = discord.Embed(
                 title=f"{emoji} {label} Netflix Generated!",
                 description="Account details have been sent to your DMs. Check your DM for login links.",
@@ -907,6 +915,7 @@ class GeneratorCog(commands.Cog):
             ephemeral_embed.set_footer(text=f"Expires: {nft.get('expires_at_utc', 'Unknown')} | One‑time use")
             await interaction.followup.send(embed=ephemeral_embed, ephemeral=True)
 
+            # Public announcement in the channel (not ephemeral)
             public_embed = discord.Embed(
                 title="🎉 Netflix Account Generated!",
                 description=(
@@ -916,7 +925,7 @@ class GeneratorCog(commands.Cog):
                 ),
                 color=discord.Color.green(),
             )
-            await interaction.channel.send(embed=public_embed)
+            await interaction.channel.send(embed=public_embed)   # <-- public, visible to all
             return
 
         await interaction.followup.send(
@@ -943,7 +952,7 @@ class GeneratorCog(commands.Cog):
     async def pgen(self, interaction: discord.Interaction):
         await self._generate(interaction, "premium", "Premium", "💎")
 
-    # ---------- ADMIN: RESTOCK (with detailed per‑cookie logging) ----------
+    # ---------- ADMIN: RESTOCK (with per‑cookie source + CPM logging) ----------
     @app_commands.command(
         name="restock",
         description="[ADMIN] Upload up to 5 files (.txt/.json/.zip) — auto-extracted, checked & sorted",
@@ -970,8 +979,9 @@ class GeneratorCog(commands.Cog):
                 ephemeral=True,
             )
 
-        all_accounts: list[str] = []
-        file_names:   list[str] = []
+        # Build a list of (cookie_text, attachment_name, inner_name)
+        entries: list[tuple[str, str, str | None]] = []   # (cookie, attach_name, inner_or_none)
+        file_summaries: list[str] = []
 
         for att in attachments:
             try:
@@ -982,26 +992,33 @@ class GeneratorCog(commands.Cog):
                 )
 
             if att.filename.lower().endswith(".zip"):
-                found, inner_summary = extract_cookies_from_zip(raw_bytes)
-                all_accounts.extend(found)
-                inner_lines = "\n  ".join(inner_summary) if inner_summary else "(empty)"
-                file_names.append(
-                    f"`{att.filename}` → {len(found)} cookies\n  {inner_lines}"
-                )
+                with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+                    for name in zf.namelist():
+                        if name.endswith("/") or not name.lower().endswith((".txt", ".json")):
+                            continue
+                        try:
+                            raw = zf.read(name).decode("utf-8", errors="ignore")
+                        except:
+                            continue
+                        cookies = parse_cookie_file(raw)
+                        for c in cookies:
+                            entries.append((c, att.filename, name))
+                file_summaries.append(f"`{att.filename}` (zip, {len(entries)} total cookies)")
             else:
                 raw = raw_bytes.decode("utf-8", errors="ignore")
-                found = parse_cookie_file(raw)
-                all_accounts.extend(found)
-                file_names.append(f"`{att.filename}` ({len(found)} cookies)")
+                cookies = parse_cookie_file(raw)
+                for c in cookies:
+                    entries.append((c, att.filename, None))
+                file_summaries.append(f"`{att.filename}` ({len(cookies)} cookies)")
 
-        if not all_accounts:
+        if not entries:
             return await interaction.followup.send(
                 "❌ No valid Netflix cookies found in any uploaded file.",
                 ephemeral=True,
             )
 
         await interaction.followup.send(
-            f"⏳ Scanning **{len(all_accounts)}** cookie(s) from **{len(attachments)}** file(s)… Please wait.",
+            f"⏳ Scanning **{len(entries)}** cookie(s) from **{len(attachments)}** file(s)… Please wait.",
             ephemeral=True,
         )
 
@@ -1010,14 +1027,14 @@ class GeneratorCog(commands.Cog):
         # Deduplicate against existing IDs
         existing_ids: set[str] = await loop.run_in_executor(None, db.existing_netflix_ids)
         seen_ids = set(existing_ids)
-        unique = []
+        unique_entries = []
         dupes = 0
-        for cookie in all_accounts:
-            nid = netscape_to_dict(cookie).get("NetflixId", "").strip()
+        for cookie_text, att_name, inner_name in entries:
+            nid = netscape_to_dict(cookie_text).get("NetflixId", "").strip()
             if nid and nid in seen_ids:
                 dupes += 1
             else:
-                unique.append(cookie)
+                unique_entries.append((cookie_text, att_name, inner_name))
                 if nid:
                     seen_ids.add(nid)
 
@@ -1029,42 +1046,52 @@ class GeneratorCog(commands.Cog):
         executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
         sem = asyncio.Semaphore(SEM_LIMIT)
 
-        total_unique = len(unique)
+        total_unique = len(unique_entries)
         checked_count = 0
         dead_local = 0
         active_local = 0
         on_hold_local = 0
         lock = asyncio.Lock()
-        log_lines = []   # <-- collects per-cookie details
+        log_lines = []
+        start_time = time.time()
 
-        async def _check_with_progress(cookie: str) -> dict:
+        async def _check_with_progress(entry: tuple[str, str, str | None]) -> dict:
             nonlocal checked_count, dead_local, active_local, on_hold_local, log_lines
-            # Extract short NetflixId for logging
-            short_id = netscape_to_dict(cookie).get("NetflixId", "?")[:12]
+            cookie_text, att_name, inner_name = entry
             async with sem:
-                result = await loop.run_in_executor(executor, check_nf_cookie, cookie)
+                result = await loop.run_in_executor(executor, check_nf_cookie, cookie_text)
             async with lock:
                 checked_count += 1
-                # Build log line
+                # Source display name
+                src_name = inner_name if inner_name else att_name
+                zip_suffix = f" -> {att_name}" if inner_name else ""
+                # Determine status and reason
                 if result["ok"]:
                     full_info = result.get("full_info", {})
                     if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
                         on_hold_local += 1
-                        line = f"{short_id:12} | HOLD  | On Hold"
+                        reason = "on hold"
+                        line = f"[HOLD]  {src_name}{zip_suffix} [{reason}]"
                     else:
                         active_local += 1
                         plan = result.get("plan", "?")
                         country = result.get("country", "?")
-                        line = f"{short_id:12} | ACTIVE | {plan} ({country})"
+                        reason = f"{plan} ({country})"
+                        line = f"[ACTIVE] {src_name}{zip_suffix} [{reason}]"
                 else:
                     dead_local += 1
                     reason = result.get("reason", "unknown")
-                    line = f"{short_id:12} | DEAD  | {reason[:50]}"
+                    line = f"[DEAD]  {src_name}{zip_suffix} [{reason}]"
+
+                # Compute current CPM
+                elapsed = time.time() - start_time
+                cpm = int((checked_count / elapsed) * 60) if elapsed > 0 else 0
+                line += f" CPM: {cpm}"
                 log_lines.append(line)
             return result
 
         async def _progress_logger():
-            """Send summary + detailed logs to webhook every 2 seconds."""
+            """Send logs to webhook every 2 seconds."""
             while True:
                 await asyncio.sleep(2)
                 async with lock:
@@ -1086,12 +1113,11 @@ class GeneratorCog(commands.Cog):
                 )
                 await self._webhook_log(embed=summary_embed)
 
-                # Detailed log embed (only if there are new entries)
+                # Detailed logs embed
                 if logs_to_send:
                     log_text = "\n".join(logs_to_send)
-                    # Discord embed description limit is 4096; truncate if necessary
-                    if len(log_text) > 4092:
-                        log_text = log_text[:4092] + "\n..."
+                    if len(log_text) > 4090:
+                        log_text = log_text[:4090] + "\n…"
                     log_embed = discord.Embed(
                         title="📋 Latest Account Checks",
                         description=f"```\n{log_text}\n```",
@@ -1099,14 +1125,13 @@ class GeneratorCog(commands.Cog):
                     )
                     await self._webhook_log(embed=log_embed)
 
-        # Log start
         await self._webhook_log(
-            f"📥 **Restock started** by {interaction.user.mention} — {len(unique)} unique cookies to check."
+            f"📥 **Restock started** by {interaction.user.mention} — {len(unique_entries)} unique cookies to check."
         )
 
         progress_task = asyncio.create_task(_progress_logger())
         try:
-            results = await asyncio.gather(*[_check_with_progress(c) for c in unique])
+            results = await asyncio.gather(*[_check_with_progress(e) for e in unique_entries])
         finally:
             executor.shutdown(wait=False)
 
@@ -1116,22 +1141,23 @@ class GeneratorCog(commands.Cog):
         except asyncio.CancelledError:
             pass
 
-        # Final sorting (unchanged)
+        # Sort results
         sorted_cookies = {"free": [], "booster": [], "premium": []}
         dead = 0
         on_hold = 0
 
-        for cookie, res in zip(unique, results):
+        for (cookie_text, _, _), res in zip(unique_entries, results):
             if res["ok"]:
                 full_info = res.get("full_info", {})
                 if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
                     on_hold += 1
                     continue
                 tier = classify_tier(res.get("plan", ""), res.get("quality", ""))
-                sorted_cookies[tier].append(cookie)
+                sorted_cookies[tier].append(cookie_text)
             else:
                 dead += 1
 
+        # Save to DB
         data = await loop.run_in_executor(None, db.get_all)
         for t in ("free", "booster", "premium"):
             data["nf"][t].extend(sorted_cookies[t])
@@ -1139,7 +1165,8 @@ class GeneratorCog(commands.Cog):
 
         final_stock = await loop.run_in_executor(None, db.stock)
 
-        files_value = "\n".join(file_names)
+        # Admin embed
+        files_value = "\n".join(file_summaries)
         if len(files_value) > 900:
             files_value = files_value[:900] + "\n…"
 
@@ -1154,13 +1181,14 @@ class GeneratorCog(commands.Cog):
         admin_embed.add_field(name="💀 Dead Filtered",   value=f"`{dead}`",                    inline=True)
         admin_embed.add_field(name="♻️ Duplicates Skipped", value=f"`{dupes}`",               inline=True)
         admin_embed.add_field(name="⏸️ On Hold Skipped", value=f"`{on_hold}`",                 inline=True)
-        admin_embed.add_field(name="📊 Total Scanned",   value=f"`{len(all_accounts)}`",       inline=True)
+        admin_embed.add_field(name="📊 Total Scanned",   value=f"`{len(entries)}`",       inline=True)
         admin_embed.add_field(name="👤 Restocked by",    value=interaction.user.mention,       inline=False)
         if not save_ok:
             admin_embed.add_field(name="⚠️ Warning", value="Supabase write may have failed.", inline=False)
 
         await interaction.followup.send(embed=admin_embed)
 
+        # Public restock channel embed
         restock_channel = self.bot.get_channel(RESTOCK_CHANNEL_ID)
         if restock_channel:
             pub_embed = discord.Embed(
@@ -1186,7 +1214,6 @@ class GeneratorCog(commands.Cog):
                     ephemeral=True
                 )
 
-        # Final log summary
         await self._webhook_log(
             f"✅ **Restock finished** by {interaction.user.mention}\n"
             f"Premium: +{len(sorted_cookies['premium'])}  "
