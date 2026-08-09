@@ -8,6 +8,7 @@ import re
 import sys
 import threading
 import unicodedata
+import urllib.parse
 import warnings
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -752,11 +753,12 @@ def build_links_for_tier(token: str, tier: str) -> list[tuple[str, str]]:
     t = _decode(token)
     if not t:
         return []
-    links = [("🖥️ PC Login", f"[Click here to login](https://netflix.com/?nftoken={t})")]
+    encoded = urllib.parse.quote(t, safe='')
+    links = [("🖥️ PC Login", f"[Click here to login](https://netflix.com/?nftoken={encoded})")]
     if tier in ("booster", "premium"):
-        links.append(("📱 Mobile Login", f"[Click here to login](https://netflix.com/unsupported?nftoken={t})"))
+        links.append(("📱 Mobile Login", f"[Click here to login](https://netflix.com/unsupported?nftoken={encoded})"))
     if tier == "premium":
-        links.append(("📺 TV Login", f"[Click here to login](https://netflix.com/tv8?nftoken={t})"))
+        links.append(("📺 TV Login", f"[Click here to login](https://netflix.com/tv8?nftoken={encoded})"))
     return links
 
 # ==========================================
@@ -776,8 +778,8 @@ def in_channel(channel_id: int):
 # 7. GENERATOR COG (UPDATED WITH FAST RESTOCK & CUSTOM NOTIFICATION)
 # ==========================================
 
-# Restock channel notification image URL - change this to your desired image
-RESTOCK_IMAGE_URL = "https://drive.google.com/file/d/1XfkCzgKixfwH7QJ332YnG--NTI8aTv5D/view?usp=drive_link"   # <-- replace with actual image link
+# Restock channel notification image URL - change this to a direct image URL (ending in .png, .jpg, etc.)
+RESTOCK_IMAGE_URL = "https://drive.google.com/file/d/1XfkCzgKixfwH7QJ332YnG--NTI8aTv5D/view?usp=drive_link"   # <-- replace with actual direct image link
 
 class GeneratorCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -802,11 +804,13 @@ class GeneratorCog(commands.Cog):
             check = await loop.run_in_executor(None, check_nf_cookie, cookie)
             if not check["ok"]:
                 if "NFToken" in check.get("reason", ""):
+                    # NFToken generation failed, but maybe another cookie works
                     await interaction.followup.send(
                         f"❌ Something went wrong while generating your account. "
                         f"Please open a ticket in <#{TICKET_CHANNEL_ID}> and report the problem.",
                         ephemeral=True,
                     )
+                    # Do not push back – NFToken failure likely means account is dead
                     continue
                 print(f"[Gen] Dead {tier} cookie (attempt {attempt+1}): {check.get('reason')}")
                 continue
@@ -823,8 +827,8 @@ class GeneratorCog(commands.Cog):
 
             links = build_links_for_tier(nft["token"], tier)
             link_lines = []
-            for label, url in links:
-                link_lines.append(f"{label}: {url}")
+            for lbl, url in links:
+                link_lines.append(f"{lbl}: {url}")
             links_text = "\n".join(link_lines)
 
             dm_embed = discord.Embed(
@@ -881,12 +885,15 @@ class GeneratorCog(commands.Cog):
                 dm_success = False
 
             if not dm_success:
+                # DM failed – put cookie back so it's not wasted
+                await loop.run_in_executor(None, db.push_cookies, tier, [cookie])
                 await interaction.followup.send(
                     "❌ I couldn't send you a DM. Please enable DMs and try again.",
                     ephemeral=True,
                 )
                 return
 
+            # Ephemeral confirmation for the user
             ephemeral_embed = discord.Embed(
                 title=f"{emoji} {label} Netflix Generated!",
                 description="Account details have been sent to your DMs. Check your DM for login links.",
@@ -895,6 +902,7 @@ class GeneratorCog(commands.Cog):
             ephemeral_embed.set_footer(text=f"Expires: {nft.get('expires_at_utc', 'Unknown')} | One‑time use")
             await interaction.followup.send(embed=ephemeral_embed, ephemeral=True)
 
+            # Public announcement in the channel (not ephemeral)
             public_embed = discord.Embed(
                 title="🎉 Netflix Account Generated!",
                 description=(
@@ -904,7 +912,7 @@ class GeneratorCog(commands.Cog):
                 ),
                 color=discord.Color.green(),
             )
-            await interaction.followup.send(embed=public_embed, ephemeral=False)
+            await interaction.channel.send(embed=public_embed)   # <-- public, visible to all
             return
 
         await interaction.followup.send(
@@ -1051,7 +1059,7 @@ class GeneratorCog(commands.Cog):
         final_stock = await loop.run_in_executor(None, db.stock)
 
         # ===================================
-        # ADMIN EPHEMERAL EMBED (unchanged)
+        # ADMIN EPHEMERAL EMBED
         # ===================================
         files_value = "\n".join(file_names)
         if len(files_value) > 900:
@@ -1076,7 +1084,7 @@ class GeneratorCog(commands.Cog):
         await interaction.followup.send(embed=admin_embed)  # stays ephemeral
 
         # ===================================
-        # PUBLIC RESTOCK CHANNEL EMBED (NEW)
+        # PUBLIC RESTOCK CHANNEL EMBED
         # ===================================
         restock_channel = self.bot.get_channel(RESTOCK_CHANNEL_ID)
         if restock_channel:
@@ -1091,10 +1099,10 @@ class GeneratorCog(commands.Cog):
                     f"*🌟 Boosters Stock = {final_stock['booster']}*\n"
                     f"*👑 Premium Stock = {final_stock['premium']}*"
                 ),
-                color=0xd2af26,   # requested color
+                color=0xd2af26,   # gold
             )
             pub_embed.set_footer(text="⚠️ All Accounts Working With No Errors")
-            pub_embed.set_image(url=RESTOCK_IMAGE_URL)
+            pub_embed.set_image(url=RESTOCK_IMAGE_URL)   # ensure this is a direct image URL
             try:
                 await restock_channel.send(embed=pub_embed)
             except Exception as e:
@@ -1235,7 +1243,7 @@ class GeneratorCog(commands.Cog):
                     zf.writestr(f"{tier_name}.txt", content)
 
         zip_buffer.seek(0)
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")   # fixed deprecated utcnow
         file = discord.File(
             fp=zip_buffer,
             filename=f"vault_export_{timestamp}.zip",
@@ -1296,7 +1304,7 @@ class NetflixBot(commands.Bot):
     async def setup_hook(self):
         await self.add_cog(GeneratorCog(self))
 
-        if os.environ.get("FORCE_SYNC", "").lower() == "true":
+        if (os.environ.get("FORCE_SYNC", "") or "").lower() == "true":
             guild_id = os.environ.get("DISCORD_GUILD_ID", "").strip()
             if guild_id:
                 g = discord.Object(id=int(guild_id))
@@ -1326,6 +1334,7 @@ class NetflixBot(commands.Bot):
 
         if isinstance(error, app_commands.CheckFailure):
             msg = str(error)
+            # Show custom message (from channel guard) or default
             emb = discord.Embed(description=msg if msg and "check functions" not in msg.lower()
                                 else "❌ You can't use this command here.",
                                 color=discord.Color.orange())
