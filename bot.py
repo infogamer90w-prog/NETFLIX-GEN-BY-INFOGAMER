@@ -804,7 +804,6 @@ class GeneratorCog(commands.Cog):
         self, interaction: discord.Interaction,
         tier: str, label: str, emoji: str,
     ) -> None:
-        # ---- _generate stays exactly as before (no changes) ----
         await interaction.response.defer(ephemeral=True)
         loop = asyncio.get_running_loop()
         for attempt in range(5):
@@ -944,7 +943,7 @@ class GeneratorCog(commands.Cog):
     async def pgen(self, interaction: discord.Interaction):
         await self._generate(interaction, "premium", "Premium", "💎")
 
-    # ---------- ADMIN: RESTOCK (with webhook progress) ----------
+    # ---------- ADMIN: RESTOCK (with detailed per‑cookie logging) ----------
     @app_commands.command(
         name="restock",
         description="[ADMIN] Upload up to 5 files (.txt/.json/.zip) — auto-extracted, checked & sorted",
@@ -1036,40 +1035,69 @@ class GeneratorCog(commands.Cog):
         active_local = 0
         on_hold_local = 0
         lock = asyncio.Lock()
+        log_lines = []   # <-- collects per-cookie details
 
         async def _check_with_progress(cookie: str) -> dict:
-            nonlocal checked_count, dead_local, active_local, on_hold_local
+            nonlocal checked_count, dead_local, active_local, on_hold_local, log_lines
+            # Extract short NetflixId for logging
+            short_id = netscape_to_dict(cookie).get("NetflixId", "?")[:12]
             async with sem:
                 result = await loop.run_in_executor(executor, check_nf_cookie, cookie)
             async with lock:
                 checked_count += 1
+                # Build log line
                 if result["ok"]:
                     full_info = result.get("full_info", {})
                     if str(full_info.get("holdStatus", "")).strip().lower() == "yes":
                         on_hold_local += 1
+                        line = f"{short_id:12} | HOLD  | On Hold"
                     else:
                         active_local += 1
+                        plan = result.get("plan", "?")
+                        country = result.get("country", "?")
+                        line = f"{short_id:12} | ACTIVE | {plan} ({country})"
                 else:
                     dead_local += 1
+                    reason = result.get("reason", "unknown")
+                    line = f"{short_id:12} | DEAD  | {reason[:50]}"
+                log_lines.append(line)
             return result
 
         async def _progress_logger():
+            """Send summary + detailed logs to webhook every 2 seconds."""
             while True:
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
                 async with lock:
                     done = checked_count
                     remaining = total_unique - done
-                    if remaining == 0:
+                    logs_to_send = log_lines.copy()
+                    log_lines.clear()
+                    if remaining == 0 and not logs_to_send:
                         break
-                    embed = discord.Embed(
-                        title="🔄 Restock Progress",
-                        description=(
-                            f"**{done}/{total_unique}** cookies checked\n"
-                            f"🟢 Active: {active_local}  💀 Dead: {dead_local}  ⏸️ Hold: {on_hold_local}"
-                        ),
-                        color=discord.Color.blurple()
+
+                # Summary embed
+                summary_embed = discord.Embed(
+                    title="🔄 Restock Progress",
+                    description=(
+                        f"**{done}/{total_unique}** cookies checked\n"
+                        f"🟢 Active: {active_local}  💀 Dead: {dead_local}  ⏸️ Hold: {on_hold_local}"
+                    ),
+                    color=discord.Color.blurple()
+                )
+                await self._webhook_log(embed=summary_embed)
+
+                # Detailed log embed (only if there are new entries)
+                if logs_to_send:
+                    log_text = "\n".join(logs_to_send)
+                    # Discord embed description limit is 4096; truncate if necessary
+                    if len(log_text) > 4092:
+                        log_text = log_text[:4092] + "\n..."
+                    log_embed = discord.Embed(
+                        title="📋 Latest Account Checks",
+                        description=f"```\n{log_text}\n```",
+                        color=discord.Color.dark_gray()
                     )
-                    await self._webhook_log(embed=embed)
+                    await self._webhook_log(embed=log_embed)
 
         # Log start
         await self._webhook_log(
@@ -1088,6 +1116,7 @@ class GeneratorCog(commands.Cog):
         except asyncio.CancelledError:
             pass
 
+        # Final sorting (unchanged)
         sorted_cookies = {"free": [], "booster": [], "premium": []}
         dead = 0
         on_hold = 0
@@ -1157,6 +1186,7 @@ class GeneratorCog(commands.Cog):
                     ephemeral=True
                 )
 
+        # Final log summary
         await self._webhook_log(
             f"✅ **Restock finished** by {interaction.user.mention}\n"
             f"Premium: +{len(sorted_cookies['premium'])}  "
@@ -1165,7 +1195,7 @@ class GeneratorCog(commands.Cog):
             f"Dead: {dead}  Duplicates: {dupes}  On-hold: {on_hold}"
         )
 
-    # ---------- other admin commands ----------
+    # ---------- other admin commands (unchanged) ----------
     @app_commands.command(name="stock", description="📦 Check Netflix account stock levels")
     @in_channel(ADMIN_CHANNEL_ID)
     async def stock(self, interaction: discord.Interaction):
